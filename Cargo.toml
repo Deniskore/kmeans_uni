@@ -1,0 +1,48 @@
+[package]
+name = "kmeans_uni"
+version = "0.1.0"
+authors = ["Denis Avvakumov"]
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/Deniskore/kmeans_uni"
+homepage = "https://github.com/Deniskore"
+edition = "2024"
+description = "Fast, safe K-Means++ with SIMD acceleration, mini-batch training and WASM support."
+categories = ["algorithms", "science", "mathematics"]
+keywords = ["kmeans", "clustering", "machine-learning"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["wide"]
+wide = ["dep:wide"]
+serde = ["dep:serde"]
+wasm = ["dep:wasm-bindgen", "dep:js-sys"]
+
+[dependencies]
+bytemuck = "1.24.0"
+cfg-if = "1.0"
+num-traits = "0.2.19"
+rand = "0.9.2"
+getrandom = { version = "0.3", features = ["wasm_js"] }
+rayon = "1.11.0"
+thiserror = "2.0.17"
+wide = { version = "1.0.2", optional = true }
+serde = { version = "1.0", features = ["derive"], optional = true }
+wasm-bindgen = { version = "0.2", optional = true }
+js-sys = { version = "0.3", optional = true }
+
+[dev-dependencies]
+linfa = "0.8.0"
+linfa-clustering = "0.8.0"
+linfa-nn = "0.8.0"
+ndarray = "0.16"
+rand08 = { package = "rand", version = "0.8" }
+divan = "0.1.21"
+memmap2 = "0.9.9"
+tempfile = "3.23.0"
+
+[[bench]]
+name = "kmeans_bench"
+harness = false

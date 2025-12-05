@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  check:
+    name: Cargo Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: cargo check (default features)
+        run: cargo check --all-targets
+      - name: cargo check (no default features)
+        run: cargo check --all-targets --no-default-features
+
+  test:
+    name: Cargo Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: cargo test (default features)
+        run: cargo test --lib --bins --tests
+      - name: cargo test (no default features)
+        run: cargo test --lib --bins --tests --no-default-features
+
+  wasm-check:
+    name: WASM Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: cargo check (wasm target)
+        run: cargo check --target wasm32-unknown-unknown --no-default-features --features wasm
+      - name: Install wasm-pack
+        run: cargo install wasm-pack
+      - name: wasm-pack build (standard)
+        run: wasm-pack build --target web --out-dir examples/wasm/pkg -- --features wasm
+      - name: wasm-pack build (simd)
+        run: RUSTFLAGS="-C target-feature=+simd128" wasm-pack build --target web --out-dir examples/wasm/pkg -- --features wasm,wide

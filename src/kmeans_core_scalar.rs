@@ -1,0 +1,238 @@
+use rand::Rng;
+
+use crate::Primitive;
+use crate::backend::CoreBackend;
+use crate::kmeans_core_common::{
+    calculate_and_update_min_distance_generic, calculate_and_update_min_distance_generic_sum,
+    find_nearest_centroids_generic,
+};
+use crate::point_source::PointSource;
+
+pub struct ScalarBackend;
+
+impl<F: Primitive> CoreBackend<F> for ScalarBackend {
+    fn accumulate_point_slice(point: &[F], ncols: usize, sums: &mut [F], label: usize) {
+        let cluster_sums = &mut sums[label * ncols..(label + 1) * ncols];
+        for (sum, val) in cluster_sums.iter_mut().zip(point) {
+            *sum = *sum + *val;
+        }
+    }
+
+    fn prepare_centroids(centroids: &[F], _ncols: usize, _k: usize) -> Vec<F> {
+        centroids.to_vec()
+    }
+
+    fn finalize_centroids(packed: &[F], _ncols: usize, _k: usize) -> Vec<F> {
+        packed.to_vec()
+    }
+
+    fn update_centroids<R: Rng, S: PointSource<F>>(
+        centroids: &mut [F],
+        sums: &[F],
+        counts: &[usize],
+        ncols: usize,
+        source: &S,
+        rng: &mut R,
+    ) {
+        for c in 0..counts.len() {
+            if counts[c] > 0 {
+                let base = c * ncols;
+                let inv_count = F::one() / F::from(counts[c]).unwrap_or(F::one());
+                for j in 0..ncols {
+                    centroids[base + j] = sums[base + j] * inv_count;
+                }
+            } else if source.num_points() > 0 {
+                let idx = rng.random_range(0..source.num_points());
+                let centroid = &mut centroids[c * ncols..(c + 1) * ncols];
+                source.read_batch(idx, 1, centroid);
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn find_nearest_centroids_euc(
+        points: &[F],
+        ncols: usize,
+        centroids: &[F],
+        k: usize,
+        out_indices: &mut [usize],
+        out_distances: Option<&mut [F]>,
+    ) {
+        find_nearest_centroids_generic(
+            points,
+            ncols,
+            k,
+            out_indices,
+            out_distances,
+            |points_batch, batch_size, indices_batch, dists_batch| {
+                const POINT_BATCH: usize = 4;
+                let mut best_indices = [0usize; POINT_BATCH];
+                let mut best_dists = [F::infinity(); POINT_BATCH];
+
+                for (c_idx, centroid) in centroids.chunks_exact(ncols).enumerate() {
+                    for (i, point) in points_batch.chunks_exact(ncols).enumerate() {
+                        let mut d = F::zero();
+                        for (p, c) in point.iter().zip(centroid) {
+                            let dv = *p - *c;
+                            d = d + dv * dv;
+                        }
+
+                        if d < best_dists[i] {
+                            best_dists[i] = d;
+                            best_indices[i] = c_idx;
+                        }
+                    }
+                }
+
+                indices_batch[..batch_size].copy_from_slice(&best_indices[..batch_size]);
+                if let Some(dists) = dists_batch {
+                    dists[..batch_size].copy_from_slice(&best_dists[..batch_size]);
+                }
+            },
+        )
+    }
+
+    #[inline(always)]
+    fn find_nearest_centroids_dot_product(
+        points: &[F],
+        ncols: usize,
+        centroids: &[F],
+        k: usize,
+        out_indices: &mut [usize],
+        out_distances: Option<&mut [F]>,
+    ) {
+        find_nearest_centroids_generic(
+            points,
+            ncols,
+            k,
+            out_indices,
+            out_distances,
+            |points_batch, batch_size, indices_batch, dists_batch| {
+                const POINT_BATCH: usize = 4;
+                let mut best_indices = [0usize; POINT_BATCH];
+                let mut best_dots = [F::neg_infinity(); POINT_BATCH];
+
+                for (c_idx, centroid) in centroids.chunks_exact(ncols).enumerate() {
+                    for (i, point) in points_batch.chunks_exact(ncols).enumerate() {
+                        let mut dot = F::zero();
+                        for (p, c) in point.iter().zip(centroid) {
+                            dot = dot + *p * *c;
+                        }
+
+                        if dot > best_dots[i] {
+                            best_dots[i] = dot;
+                            best_indices[i] = c_idx;
+                        }
+                    }
+                }
+
+                indices_batch[..batch_size].copy_from_slice(&best_indices[..batch_size]);
+                if let Some(dists) = dists_batch {
+                    dists[..batch_size].copy_from_slice(&best_dots[..batch_size]);
+                }
+            },
+        )
+    }
+
+    #[inline(always)]
+    fn find_nearest_centroids_euc_with_dists(
+        points: &[F],
+        ncols: usize,
+        centroids: &[F],
+        k: usize,
+        out_indices: &mut [usize],
+        out_distances: &mut [F],
+    ) {
+        Self::find_nearest_centroids_euc(
+            points,
+            ncols,
+            centroids,
+            k,
+            out_indices,
+            Some(out_distances),
+        )
+    }
+
+    #[inline(always)]
+    fn find_nearest_centroids_dot_product_with_dists(
+        points: &[F],
+        ncols: usize,
+        centroids: &[F],
+        k: usize,
+        out_indices: &mut [usize],
+        out_distances: &mut [F],
+    ) {
+        Self::find_nearest_centroids_dot_product(
+            points,
+            ncols,
+            centroids,
+            k,
+            out_indices,
+            Some(out_distances),
+        )
+    }
+
+    #[inline(always)]
+    fn calculate_and_update_min_distance_euc(
+        points: &[F],
+        ncols: usize,
+        centroid: &[F],
+        min_dists: &mut [F],
+    ) {
+        calculate_and_update_min_distance_generic(points, ncols, min_dists, |point, min_dist| {
+            let mut d = F::zero();
+            for (p, c) in point.iter().zip(centroid) {
+                let dv = *p - *c;
+                d = d + dv * dv;
+            }
+            if d < *min_dist {
+                *min_dist = d;
+            }
+        })
+    }
+
+    #[inline(always)]
+    fn calculate_and_update_min_distance_euc_sum(
+        points: &[F],
+        ncols: usize,
+        centroid: &[F],
+        min_dists: &mut [F],
+    ) -> F {
+        calculate_and_update_min_distance_generic_sum(
+            points,
+            ncols,
+            min_dists,
+            |point, min_dist| {
+                let mut d = F::zero();
+                for (p, c) in point.iter().zip(centroid) {
+                    let dv = *p - *c;
+                    d = d + dv * dv;
+                }
+                if d < *min_dist {
+                    *min_dist = d;
+                }
+            },
+        )
+    }
+
+    #[inline(always)]
+    fn calculate_and_update_min_distance_dot(
+        points: &[F],
+        ncols: usize,
+        centroid: &[F],
+        min_dists: &mut [F],
+    ) {
+        // Fallback to Euclidean for initialization stability
+        Self::calculate_and_update_min_distance_euc(points, ncols, centroid, min_dists)
+    }
+
+    #[inline(always)]
+    fn calculate_and_update_min_distance_dot_sum(
+        points: &[F],
+        ncols: usize,
+        centroid: &[F],
+        min_dists: &mut [F],
+    ) -> F {
+        Self::calculate_and_update_min_distance_euc_sum(points, ncols, centroid, min_dists)
+    }
+}

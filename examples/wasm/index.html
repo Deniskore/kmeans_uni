@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>KMeans WASM Demo</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; line-height: 1.5; }
+    pre { background: #f5f5f5; padding: 0.75rem; border-radius: 6px; white-space: pre-wrap; word-break: break-word; }
+    button { padding: 0.5rem 1rem; }
+    label { display: inline-flex; align-items: center; gap: 0.4rem; }
+  </style>
+</head>
+<body>
+  <h1>KMeans WASM Demo</h1>
+  <p>This demo trains small K-Means++ models in the browser (wasm) and predicts labels for the same points.</p>
+  <label><input type="checkbox" id="use-simd" /> Use SIMD (requires simd128 build)</label>
+  <br />
+  <button id="run">Run f32 demo</button>
+  <button id="run64">Run f64 demo</button>
+  <pre id="output">Loading...</pre>
+
+  <script type="module">
+    import init, { WasmModel, WasmModelF64 } from "./pkg/kmeans_uni.js";
+
+    const output = document.getElementById("output");
+    output.textContent = "Ready.";
+
+    const runDemo = async (useF64) => {
+      output.textContent = `Running ${useF64 ? "f64" : "f32"}...`;
+      await init();
+
+    // Generate two Gaussian-ish clusters (32 points each) in 2D
+      const pts = [];
+      for (let i = 0; i < 32; i++) {
+        pts.push(1 + 0.2 * (Math.random() - 0.5));
+        pts.push(1 + 0.2 * (Math.random() - 0.5));
+      }
+      for (let i = 0; i < 32; i++) {
+        pts.push(-1 + 0.2 * (Math.random() - 0.5));
+        pts.push(-1 + 0.2 * (Math.random() - 0.5));
+      }
+      const points = useF64 ? new Float64Array(pts) : new Float32Array(pts);
+
+      try {
+          const useSimd = document.getElementById("use-simd").checked;
+          const model = useF64
+            ? new WasmModelF64(points, 2, 2, 200, useSimd)
+            : new WasmModel(points, 2, 2, 200, useSimd);
+          const labels = model.predict(points);
+          const centroids = model.centroids();
+          const centroidRows = [];
+          for (let i = 0; i < centroids.length; i += 2) {
+            centroidRows.push(`[${centroids[i].toFixed(4)}, ${centroids[i + 1].toFixed(4)}]`);
+          }
+          output.textContent =
+            `Mode: ${useF64 ? "f64" : "f32"}\n` +
+            `Points: ${points.length / 2}\n` +
+            `Labels:\n${Array.from(labels).join(", ")}\n\n` +
+            `Centroids:\n${centroidRows.join("\n")}`;
+      } catch (err) {
+          output.textContent = `Error: ${err}`;
+      }
+    };
+
+    document.getElementById("run").addEventListener("click", () => runDemo(false));
+    document.getElementById("run64").addEventListener("click", () => runDemo(true));
+  </script>
+</body>
+</html>
