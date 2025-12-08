@@ -6,7 +6,7 @@ use js_sys::Uint32Array;
 use wasm_bindgen::prelude::*;
 
 macro_rules! wasm_model {
-    ($name:ident, $float:ty, $to_array:ident, $doc:literal) => {
+    ($name:ident, $float:ty, $doc:literal) => {
         #[wasm_bindgen]
         #[doc = $doc]
         pub struct $name {
@@ -106,14 +106,12 @@ macro_rules! wasm_model {
 wasm_model!(
     WasmModel,
     f32,
-    to_array_f32,
     "Wasm-friendly K-Means++ model using f32 inputs/outputs."
 );
 
 wasm_model!(
     WasmModelF64,
     f64,
-    to_array_f64,
     "Wasm-friendly K-Means++ model using f64 inputs/outputs."
 );
 

@@ -24,7 +24,6 @@ pub(crate) fn run<
     tolerance: F,
     seed: Option<u64>,
 ) -> Result<(Vec<F>, F)> {
-    let _npoints = source.num_points();
     let ncols = source.num_columns();
     let mut rng = match seed {
         Some(s) => StdRng::seed_from_u64(s),
@@ -46,7 +45,7 @@ pub(crate) fn run<
             par_chunk_size,
         )?;
 
-        inertia = F::from(iter_inertia).unwrap_or(F::zero());
+        inertia = F::from(iter_inertia).ok_or(crate::error::Error::ConversionFailure)?;
 
         let old_centroids = C::finalize_centroids(&prepared_centroids, ncols, k);
 

@@ -4,6 +4,7 @@ use crate::kmeans_core_common::{
     find_nearest_centroids_generic,
 };
 use crate::point_source::PointSource;
+use crate::primitive::Primitive;
 
 pub struct SimdBackend;
 
@@ -476,7 +477,7 @@ macro_rules! impl_simd_backend {
                         }
 
                         if counts[k_idx] > 0 {
-                            inv_counts[lane] = 1.0 / counts[k_idx] as $scalar;
+                            inv_counts[lane] = 1.0 / <$scalar>::from_usize(counts[k_idx]);
                             active_mask[lane] = true;
                         } else if source.num_points() > 0 {
                             zero_indices[lane] = rng.random_range(0..source.num_points());
