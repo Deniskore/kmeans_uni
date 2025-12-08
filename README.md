@@ -1,3 +1,8 @@
+![Build Status](https://github.com/Deniskore/kmeans_uni/actions/workflows/ci.yml/badge.svg)
+[![Crates.io](https://img.shields.io/crates/v/kmeans_uni.svg)](https://crates.io/crates/kmeans_uni)
+[![API reference](https://docs.rs/kmeans_uni/badge.svg)](https://docs.rs/kmeans_uni)
+[![License](https://img.shields.io/crates/l/kmeans_uni.svg)](https://crates.io/crates/kmeans_uni)
+
 # kmeans_uni
 
 Fast, safe K-Means++ for CPU-only workloads with optional SIMD acceleration. Supports Euclidean distance and dot-product scoring, provides both classic Lloyd iterations and a mini-batch variant, and includes parity tests against `linfa-clustering` to guard correctness. Benchmarks show significantly faster training and prediction than `linfa` on the same CPU. The crate builds on stable Rust.
