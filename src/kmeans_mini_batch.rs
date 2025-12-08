@@ -139,7 +139,7 @@ pub(crate) fn run<
     let (_, _, full_inertia) =
         E::compute_stats_full::<F, C, M, S>(source, ncols, k, &prepared_centroids, par_chunk)?;
     let centroids = C::finalize_centroids(&prepared_centroids, ncols, k);
-    let inertia = F::from(full_inertia).unwrap_or(F::zero());
+    let inertia = F::from(full_inertia).ok_or(KMeansError::ConversionFailure)?;
 
     Ok((centroids, inertia))
 }

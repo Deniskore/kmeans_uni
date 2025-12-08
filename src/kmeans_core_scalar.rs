@@ -37,7 +37,8 @@ impl<F: Primitive> CoreBackend<F> for ScalarBackend {
         for c in 0..counts.len() {
             if counts[c] > 0 {
                 let base = c * ncols;
-                let inv_count = F::one() / F::from(counts[c]).unwrap_or(F::one());
+                let count_f = F::from_usize(counts[c]);
+                let inv_count = F::one() / count_f;
                 for j in 0..ncols {
                     centroids[base + j] = sums[base + j] * inv_count;
                 }

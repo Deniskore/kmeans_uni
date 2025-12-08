@@ -211,6 +211,12 @@ impl<F: Primitive> KMeans<F> {
     /// let labels = model.predict(&data).unwrap();
     /// assert_eq!(labels.len(), 2);
     /// ```
+    ///
+    /// # Notes
+    ///
+    /// This method assumes that the input `points` contains only finite floating-point values.
+    /// Accessing `NaN` or `Infinity` in the input may result in undefined behavior or
+    /// failure to produce a model.
     pub fn fit_default_scalar(points: impl AsRef<[F]>, ncols: usize, k: usize) -> Result<Self> {
         KMeansBuilder::new(k)
             .cpu_scalar()
@@ -235,6 +241,12 @@ impl<F: Primitive> KMeans<F> {
     /// let labels = model.predict_sequential(&data).unwrap();
     /// assert_eq!(labels.len(), 2);
     /// ```
+    ///
+    /// # Notes
+    ///
+    /// This method assumes that the input `points` contains only finite floating-point values.
+    /// Passing `NaN` or `Infinity` in the input may result in undefined behavior or
+    /// incorrect predictions.
     pub fn predict_sequential(&self, points: impl AsRef<[F]>) -> Result<Vec<usize>> {
         self.predict_with_backend_sequential::<CPUScalar>(points)
     }
@@ -261,7 +273,7 @@ impl<F: Primitive> KMeans<F> {
     ) -> Result<Vec<usize>> {
         self.validate_model_shape()?;
         let points = points.as_ref();
-        validate_inputs(points, self.ncols, self.k)?;
+        validate_prediction_inputs(points, self.ncols)?;
 
         let npoints = points.len() / self.ncols;
         let mut labels = vec![0usize; npoints];
@@ -347,7 +359,7 @@ impl<F: Primitive> KMeans<F> {
         source: &S,
     ) -> Result<Vec<usize>> {
         self.validate_model_shape()?;
-        validate_source_inputs(source, self.k)?;
+        validate_prediction_source_inputs(source, self.ncols)?;
         let npoints = source.num_points();
         let mut labels = vec![0usize; npoints];
 
@@ -393,10 +405,16 @@ impl<F: Primitive> KMeans<F> {
     /// For `MetricType::Euclidean` this returns squared Euclidean distances,
     /// for `MetricType::DotProduct` it returns raw dot-product similarities.
     /// Returns a flat vector of shape (n_points * k).
+    ///
+    /// # Notes
+    ///
+    /// This method assumes that the input `points` contains only finite floating-point values.
+    /// Passing `NaN` or `Infinity` in the input may result in undefined behavior or
+    /// incorrect results.
     pub fn transform(&self, points: impl AsRef<[F]>) -> Result<Vec<F>> {
         self.validate_model_shape()?;
         let points = points.as_ref();
-        validate_inputs(points, self.ncols, self.k)?;
+        validate_prediction_inputs(points, self.ncols)?;
 
         let npoints = points.len() / self.ncols;
         let mut distances = vec![F::zero(); npoints * self.k];
@@ -556,7 +574,7 @@ impl<F: Primitive> KMeansBuilder<F> {
             k,
             iterations: 100,
             attempts: 1,
-            tolerance: F::from(1e-4).unwrap_or(F::zero()),
+            tolerance: F::from(1e-4).unwrap_or(F::epsilon()),
             seed: None,
             mini_batch_rel_tolerance: kmeans_mini_batch::DEFAULT_MINI_BATCH_REL_TOL,
             mini_batch_min_iterations: kmeans_mini_batch::DEFAULT_MINI_BATCH_MIN_ITERATIONS,
@@ -585,6 +603,12 @@ impl<F: Primitive, I: InitializationStrategy> KMeansBuilder<F, BackendNotSet, Al
     ///     .unwrap();
     /// assert_eq!(model.k(), 2);
     /// ```
+    ///
+    /// # Notes
+    ///
+    /// When calling `fit()` on the resulting config, the input `points` must contain only
+    /// finite floating-point values. Passing `NaN` or `Infinity` may result in undefined
+    /// behavior or failure to produce a valid model.
     #[inline]
     pub fn build_default(self) -> KMeansConfig<F, CPUScalar, Euclidean, false, I> {
         self.cpu_scalar().euclidean().build()
@@ -940,7 +964,7 @@ fn validate_centroid_shape<F: Primitive>(centroids: &[F], ncols: usize, k: usize
             "number of centroids must be greater than zero".into(),
         ));
     }
-    if centroids.len() != ncols.saturating_mul(k) {
+    if ncols.checked_mul(k) != Some(centroids.len()) {
         return Err(KMeansError::InvalidInput(
             "centroids length must equal k * ncols".into(),
         ));
@@ -970,6 +994,13 @@ fn validate_inputs<F: Primitive>(points: &[F], ncols: usize, k: usize) -> Result
             "points must contain at least one row".into(),
         ));
     }
+    let npoints = points.len() / ncols;
+    if k > npoints {
+        return Err(KMeansError::InvalidInput(format!(
+            "number of clusters k ({}) cannot be greater than number of points ({})",
+            k, npoints
+        )));
+    }
     Ok(())
 }
 
@@ -992,6 +1023,71 @@ fn validate_source_inputs<F: Primitive, S: PointSource<F>>(source: &S, k: usize)
         return Err(KMeansError::InvalidInput(
             "number of centroids must be greater than zero".into(),
         ));
+    }
+    let npoints = source.num_points();
+    if npoints == 0 {
+        return Err(KMeansError::InvalidInput(
+            "point source must contain at least one point".into(),
+        ));
+    }
+    if k > npoints {
+        return Err(KMeansError::InvalidInput(format!(
+            "number of clusters k ({}) cannot be greater than number of points ({})",
+            k, npoints
+        )));
+    }
+    if F::from(npoints).is_none() {
+        return Err(KMeansError::InvalidInput(format!(
+            "number of points ({}) cannot be represented in the chosen floating point type",
+            npoints
+        )));
+    }
+    Ok(())
+}
+
+/// Validates input dimensions for prediction/transform operations.
+///
+/// Unlike training validation, this does NOT enforce `k <= n_points` because
+/// a trained model can predict cluster assignments for any number of points (even 1).
+#[inline]
+fn validate_prediction_inputs<F: Primitive>(points: &[F], ncols: usize) -> Result<()> {
+    if ncols == 0 {
+        return Err(KMeansError::InvalidInput(
+            "number of columns must be greater than zero".into(),
+        ));
+    }
+    if !points.len().is_multiple_of(ncols) {
+        return Err(KMeansError::InvalidInput(
+            "points length must be divisible by ncols".into(),
+        ));
+    }
+    if points.is_empty() {
+        return Err(KMeansError::InvalidInput(
+            "points must contain at least one row".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validates source input dimensions for prediction/transform operations.
+///
+/// Unlike training validation, this does NOT enforce `k <= n_points` because
+/// a trained model can predict cluster assignments for any number of points (even 1).
+fn validate_prediction_source_inputs<F: Primitive, S: PointSource<F>>(
+    source: &S,
+    expected_ncols: usize,
+) -> Result<()> {
+    if source.num_columns() == 0 {
+        return Err(KMeansError::InvalidInput(
+            "number of columns must be greater than zero".into(),
+        ));
+    }
+    if source.num_columns() != expected_ncols {
+        return Err(KMeansError::DimensionMismatch(format!(
+            "source has {} columns but model expects {}",
+            source.num_columns(),
+            expected_ncols
+        )));
     }
     if source.num_points() == 0 {
         return Err(KMeansError::InvalidInput(

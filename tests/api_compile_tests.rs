@@ -132,7 +132,8 @@ fn test_builder_type_state_progression() {
 
 #[test]
 fn test_mini_batch_api_compiles() {
-    let points = [0.0_f32, 1.0_f32];
+    // Need at least k points for k clusters
+    let points = [0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
     let source = SlicePointSource::<f32>::new(&points, 1).unwrap();
     let _ = KMeansBuilder::<f32>::new(8)
         .cpu_scalar()
