@@ -5,14 +5,14 @@
 
 # kmeans_uni
 
-Fast, safe K-Means++ for CPU-only workloads with optional SIMD acceleration. Supports Euclidean distance and dot-product scoring, provides both classic Lloyd iterations and a mini-batch variant, and includes parity tests against `linfa-clustering` to guard correctness. Benchmarks show significantly faster training and prediction than `linfa` on the same CPU. The crate builds on stable Rust.
+Fast, safe K-Means++ for CPU-only workloads with optional SIMD acceleration. Supports Euclidean distance and dot-product scoring, provides both classic Lloyd iterations and a mini-batch variant, and includes parity tests against `linfa-clustering` to guard correctness. Benchmarks show significantly faster training and prediction than `linfa-clustering` on the same CPU. The crate builds on stable Rust.
 
 ## Key Features
 
-- 100% safe Rust (`#![forbid(unsafe_code)]`) with a small dependency set.
-- Optimized for speed, beats `linfa-clustering` in AArch64/x86_64 benches for training and prediction.
+- Runs on stable Rust with 100% safe code (`#![forbid(unsafe_code)]`) and a small dependency set.
+- Optimized for speed: beats `linfa-clustering` 0.8.1 in AArch64/x86_64 benches for training and prediction; in a separate local benchmark, it also measured up to 79% lower median runtime than `kmeans` 2.0.2 across different shapes.
 - Optional SIMD acceleration (`wide` feature) and WebAssembly support (see [`WASM.md`](./WASM.md)).
-- Ergonomic builder API
+- Ergonomic builder API.
 
 ## Quickstart
 

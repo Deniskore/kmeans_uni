@@ -46,10 +46,7 @@ pub(crate) fn run<
         )?;
 
         inertia = F::from(iter_inertia).ok_or(crate::error::Error::ConversionFailure)?;
-
-        let old_centroids = C::finalize_centroids(&prepared_centroids, ncols, k);
-
-        C::update_centroids(
+        let max_shift = C::update_centroids_and_get_max_shift(
             &mut prepared_centroids,
             &sums,
             &counts,
@@ -57,17 +54,6 @@ pub(crate) fn run<
             source,
             &mut rng,
         );
-
-        let new_centroids = C::finalize_centroids(&prepared_centroids, ncols, k);
-
-        // Check convergence
-        let mut max_shift = F::zero();
-        for (old, new) in old_centroids.iter().zip(new_centroids.iter()) {
-            let diff = (*old - *new).abs();
-            if diff > max_shift {
-                max_shift = diff;
-            }
-        }
 
         if max_shift < tolerance {
             break;

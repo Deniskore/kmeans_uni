@@ -8,7 +8,7 @@ use crate::{
 };
 use rand::rngs::SmallRng;
 use rand::seq::index::sample;
-use rand::{Rng as _, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 pub(crate) const DEFAULT_MINI_BATCH_REL_TOL: f64 = 1e-4;
 pub(crate) const DEFAULT_MINI_BATCH_MIN_ITERATIONS: usize = 5;

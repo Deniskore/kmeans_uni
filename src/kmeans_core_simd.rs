@@ -1,6 +1,6 @@
 use crate::backend::CoreBackend;
 use crate::kmeans_core_common::{
-    calculate_and_update_min_distance_generic, calculate_and_update_min_distance_generic_sum,
+    calculate_and_update_min_distance_generic, calculate_transform_chunk_size,
     find_nearest_centroids_generic,
 };
 use crate::point_source::PointSource;
@@ -13,7 +13,7 @@ macro_rules! impl_simd_backend {
         mod $module {
             use super::*;
             use bytemuck::cast;
-            use rand::Rng;
+            use rand::{Rng, RngExt};
             use wide::CmpLt;
 
             type SimdVec = $vec;
@@ -46,6 +46,11 @@ macro_rules! impl_simd_backend {
                 }
 
                 #[inline(always)]
+                fn transform_points_per_chunk(ncols: usize, k: usize) -> usize {
+                    calculate_transform_chunk_size::<$scalar>(ncols, k)
+                }
+
+                #[inline(always)]
                 fn update_centroids<R: Rng, S: PointSource<$scalar>>(
                     packed_centroids: &mut [$scalar],
                     sums: &[$scalar],
@@ -54,7 +59,320 @@ macro_rules! impl_simd_backend {
                     source: &S,
                     rng: &mut R,
                 ) {
-                    update_centroids_impl(packed_centroids, sums, counts, source, ncols, rng);
+                    let _ = update_centroids_impl::<false, _>(
+                        packed_centroids,
+                        sums,
+                        counts,
+                        source,
+                        ncols,
+                        rng,
+                    );
+                }
+
+                #[inline(always)]
+                fn update_centroids_and_get_max_shift<R: Rng, S: PointSource<$scalar>>(
+                    packed_centroids: &mut [$scalar],
+                    sums: &[$scalar],
+                    counts: &[usize],
+                    ncols: usize,
+                    source: &S,
+                    rng: &mut R,
+                ) -> $scalar {
+                    update_centroids_impl::<true, _>(
+                        packed_centroids,
+                        sums,
+                        counts,
+                        source,
+                        ncols,
+                        rng,
+                    )
+                }
+
+                #[inline(always)]
+                fn assign_and_accumulate_euc(
+                    points: &[$scalar],
+                    ncols: usize,
+                    packed_centroids: &[$scalar],
+                    k: usize,
+                    sums: &mut [$scalar],
+                    counts: &mut [usize],
+                    total: &mut $scalar,
+                ) {
+                    const POINT_BATCH: usize = 64;
+                    let num_chunks = k.div_ceil(SIMD_WIDTH);
+                    let all_lanes_valid = k == num_chunks * SIMD_WIDTH;
+
+                    let mut current_indices_arr: [$idx_scalar; SIMD_WIDTH] = [0; SIMD_WIDTH];
+                    for (i, slot) in current_indices_arr.iter_mut().enumerate() {
+                        *slot = i as $idx_scalar;
+                    }
+                    let base_indices = SimdIdx::from(current_indices_arr);
+                    let increment = SimdIdx::splat(SIMD_WIDTH as $idx_scalar);
+
+                    for points_batch in points.chunks(ncols * POINT_BATCH) {
+                        let batch_size = points_batch.len() / ncols;
+                        let mut best_dists = [SimdVec::splat(<$scalar>::INFINITY); POINT_BATCH];
+                        let mut best_indices = [SimdIdx::ZERO; POINT_BATCH];
+
+                        let mut current_indices = base_indices;
+                        for chunk_data in packed_centroids
+                            .chunks_exact(ncols * SIMD_WIDTH)
+                            .take(num_chunks)
+                        {
+                            let mut lane_sums = [SimdVec::ZERO; POINT_BATCH];
+
+                            for (d, centroid_chunk) in
+                                chunk_data.chunks_exact(SIMD_WIDTH).enumerate().take(ncols)
+                            {
+                                let c_vec = load_chunk(centroid_chunk, 0);
+                                for i in 0..batch_size {
+                                    let p_val = SimdVec::splat(points_batch[i * ncols + d]);
+                                    let diff = p_val - c_vec;
+                                    lane_sums[i] += diff * diff;
+                                }
+                            }
+
+                            for i in 0..batch_size {
+                                let mask = lane_sums[i].simd_lt(best_dists[i]);
+                                best_dists[i] = mask.blend(lane_sums[i], best_dists[i]);
+                                let mask_bits: SimdIdx = cast(mask);
+                                best_indices[i] = mask_bits.blend(current_indices, best_indices[i]);
+                            }
+
+                            current_indices += increment;
+                        }
+
+                        for i in 0..batch_size {
+                            let dists = best_dists[i].to_array();
+                            let indices = best_indices[i].to_array();
+                            let mut best_idx = 0usize;
+                            let mut best_dist = <$scalar>::INFINITY;
+
+                            if all_lanes_valid {
+                                for (&dist, &idx_val) in dists.iter().zip(indices.iter()) {
+                                    if dist < best_dist {
+                                        best_dist = dist;
+                                        best_idx = idx_val as usize;
+                                    }
+                                }
+                            } else {
+                                for (&dist, &idx_val) in dists.iter().zip(indices.iter()) {
+                                    let idx = idx_val as usize;
+                                    if idx < k && dist < best_dist {
+                                        best_dist = dist;
+                                        best_idx = idx;
+                                    }
+                                }
+                            }
+
+                            counts[best_idx] += 1;
+                            let point = &points_batch[i * ncols..(i + 1) * ncols];
+                            accumulate_point_slice_impl(point, ncols, sums, best_idx);
+                            *total += best_dist;
+                        }
+                    }
+                }
+
+                #[inline(always)]
+                fn assign_and_accumulate_dot(
+                    points: &[$scalar],
+                    ncols: usize,
+                    packed_centroids: &[$scalar],
+                    k: usize,
+                    sums: &mut [$scalar],
+                    counts: &mut [usize],
+                    total: &mut $scalar,
+                ) {
+                    const POINT_BATCH: usize = 64;
+                    let num_chunks = k.div_ceil(SIMD_WIDTH);
+                    let all_lanes_valid = k == num_chunks * SIMD_WIDTH;
+
+                    let mut current_indices_arr: [$idx_scalar; SIMD_WIDTH] = [0; SIMD_WIDTH];
+                    for (i, slot) in current_indices_arr.iter_mut().enumerate() {
+                        *slot = i as $idx_scalar;
+                    }
+                    let base_indices = SimdIdx::from(current_indices_arr);
+                    let increment = SimdIdx::splat(SIMD_WIDTH as $idx_scalar);
+
+                    for points_batch in points.chunks(ncols * POINT_BATCH) {
+                        let batch_size = points_batch.len() / ncols;
+                        let mut best_dots = [SimdVec::splat(<$scalar>::NEG_INFINITY); POINT_BATCH];
+                        let mut best_indices = [SimdIdx::ZERO; POINT_BATCH];
+
+                        let mut current_indices = base_indices;
+                        for chunk_data in packed_centroids
+                            .chunks_exact(ncols * SIMD_WIDTH)
+                            .take(num_chunks)
+                        {
+                            let mut lane_sums = [SimdVec::ZERO; POINT_BATCH];
+
+                            for (d, centroid_chunk) in
+                                chunk_data.chunks_exact(SIMD_WIDTH).enumerate().take(ncols)
+                            {
+                                let c_vec = load_chunk(centroid_chunk, 0);
+                                for i in 0..batch_size {
+                                    let p_val = SimdVec::splat(points_batch[i * ncols + d]);
+                                    lane_sums[i] += p_val * c_vec;
+                                }
+                            }
+
+                            for i in 0..batch_size {
+                                let mask = best_dots[i].simd_lt(lane_sums[i]);
+                                best_dots[i] = mask.blend(lane_sums[i], best_dots[i]);
+                                let mask_bits: SimdIdx = cast(mask);
+                                best_indices[i] = mask_bits.blend(current_indices, best_indices[i]);
+                            }
+
+                            current_indices += increment;
+                        }
+
+                        for i in 0..batch_size {
+                            let dots = best_dots[i].to_array();
+                            let indices = best_indices[i].to_array();
+                            let mut best_idx = 0usize;
+                            let mut best_dot = <$scalar>::NEG_INFINITY;
+
+                            if all_lanes_valid {
+                                for (&dot, &idx_val) in dots.iter().zip(indices.iter()) {
+                                    if dot > best_dot {
+                                        best_dot = dot;
+                                        best_idx = idx_val as usize;
+                                    }
+                                }
+                            } else {
+                                for (&dot, &idx_val) in dots.iter().zip(indices.iter()) {
+                                    let idx = idx_val as usize;
+                                    if idx < k && dot > best_dot {
+                                        best_dot = dot;
+                                        best_idx = idx;
+                                    }
+                                }
+                            }
+
+                            counts[best_idx] += 1;
+                            let point = &points_batch[i * ncols..(i + 1) * ncols];
+                            accumulate_point_slice_impl(point, ncols, sums, best_idx);
+                            *total += best_dot;
+                        }
+                    }
+                }
+
+                #[inline(always)]
+                fn transform_euc(
+                    points: &[$scalar],
+                    ncols: usize,
+                    packed_centroids: &[$scalar],
+                    k: usize,
+                    out_scores: &mut [$scalar],
+                ) {
+                    let num_chunks = k.div_ceil(SIMD_WIDTH);
+                    let full_chunks = k / SIMD_WIDTH;
+
+                    for (point_idx, point) in points.chunks_exact(ncols).enumerate() {
+                        let out_row = &mut out_scores[point_idx * k..(point_idx + 1) * k];
+
+                        for (chunk_idx, chunk_data) in packed_centroids
+                            .chunks_exact(ncols * SIMD_WIDTH)
+                            .take(full_chunks)
+                            .enumerate()
+                        {
+                            let mut sums = SimdVec::ZERO;
+
+                            for (d, centroid_chunk) in
+                                chunk_data.chunks_exact(SIMD_WIDTH).enumerate().take(ncols)
+                            {
+                                let c_vec = load_chunk(centroid_chunk, 0);
+                                let p_val = SimdVec::splat(point[d]);
+                                let diff = p_val - c_vec;
+                                sums += diff * diff;
+                            }
+
+                            let arr = sums.to_array();
+                            let out_base = chunk_idx * SIMD_WIDTH;
+                            out_row[out_base..out_base + SIMD_WIDTH].copy_from_slice(&arr);
+                        }
+
+                        if full_chunks < num_chunks {
+                            let chunk_idx = full_chunks;
+                            let chunk_data = &packed_centroids[chunk_idx * ncols * SIMD_WIDTH
+                                ..(chunk_idx + 1) * ncols * SIMD_WIDTH];
+                            let mut sums = SimdVec::ZERO;
+
+                            for (d, centroid_chunk) in
+                                chunk_data.chunks_exact(SIMD_WIDTH).enumerate().take(ncols)
+                            {
+                                let c_vec = load_chunk(centroid_chunk, 0);
+                                let p_val = SimdVec::splat(point[d]);
+                                let diff = p_val - c_vec;
+                                sums += diff * diff;
+                            }
+
+                            let arr = sums.to_array();
+                            let out_base = chunk_idx * SIMD_WIDTH;
+                            for (lane, &value) in arr.iter().enumerate().take(k - out_base) {
+                                let out_idx = out_base + lane;
+                                out_row[out_idx] = value;
+                            }
+                        }
+                    }
+                }
+
+                #[inline(always)]
+                fn transform_dot(
+                    points: &[$scalar],
+                    ncols: usize,
+                    packed_centroids: &[$scalar],
+                    k: usize,
+                    out_scores: &mut [$scalar],
+                ) {
+                    let num_chunks = k.div_ceil(SIMD_WIDTH);
+                    let full_chunks = k / SIMD_WIDTH;
+
+                    for (point_idx, point) in points.chunks_exact(ncols).enumerate() {
+                        let out_row = &mut out_scores[point_idx * k..(point_idx + 1) * k];
+
+                        for (chunk_idx, chunk_data) in packed_centroids
+                            .chunks_exact(ncols * SIMD_WIDTH)
+                            .take(full_chunks)
+                            .enumerate()
+                        {
+                            let mut sums = SimdVec::ZERO;
+
+                            for (d, centroid_chunk) in
+                                chunk_data.chunks_exact(SIMD_WIDTH).enumerate().take(ncols)
+                            {
+                                let c_vec = load_chunk(centroid_chunk, 0);
+                                let p_val = SimdVec::splat(point[d]);
+                                sums += p_val * c_vec;
+                            }
+
+                            let arr = sums.to_array();
+                            let out_base = chunk_idx * SIMD_WIDTH;
+                            out_row[out_base..out_base + SIMD_WIDTH].copy_from_slice(&arr);
+                        }
+
+                        if full_chunks < num_chunks {
+                            let chunk_idx = full_chunks;
+                            let chunk_data = &packed_centroids[chunk_idx * ncols * SIMD_WIDTH
+                                ..(chunk_idx + 1) * ncols * SIMD_WIDTH];
+                            let mut sums = SimdVec::ZERO;
+
+                            for (d, centroid_chunk) in
+                                chunk_data.chunks_exact(SIMD_WIDTH).enumerate().take(ncols)
+                            {
+                                let c_vec = load_chunk(centroid_chunk, 0);
+                                let p_val = SimdVec::splat(point[d]);
+                                sums += p_val * c_vec;
+                            }
+
+                            let arr = sums.to_array();
+                            let out_base = chunk_idx * SIMD_WIDTH;
+                            for (lane, &value) in arr.iter().enumerate().take(k - out_base) {
+                                let out_idx = out_base + lane;
+                                out_row[out_idx] = value;
+                            }
+                        }
+                    }
                 }
 
                 #[inline(always)]
@@ -67,6 +385,7 @@ macro_rules! impl_simd_backend {
                     out_distances: Option<&mut [$scalar]>,
                 ) {
                     let num_chunks = k.div_ceil(SIMD_WIDTH);
+                    let all_lanes_valid = k == num_chunks * SIMD_WIDTH;
 
                     let mut current_indices_arr: [$idx_scalar; SIMD_WIDTH] = [0; SIMD_WIDTH];
                     for (i, slot) in current_indices_arr.iter_mut().enumerate() {
@@ -128,11 +447,20 @@ macro_rules! impl_simd_backend {
                                 let mut best_idx = 0;
                                 let mut best_dist = <$scalar>::INFINITY;
 
-                                for (&dist, &idx_val) in dists.iter().zip(indices.iter()) {
-                                    let idx = idx_val as usize;
-                                    if idx < k && dist < best_dist {
-                                        best_dist = dist;
-                                        best_idx = idx;
+                                if all_lanes_valid {
+                                    for (&dist, &idx_val) in dists.iter().zip(indices.iter()) {
+                                        if dist < best_dist {
+                                            best_dist = dist;
+                                            best_idx = idx_val as usize;
+                                        }
+                                    }
+                                } else {
+                                    for (&dist, &idx_val) in dists.iter().zip(indices.iter()) {
+                                        let idx = idx_val as usize;
+                                        if idx < k && dist < best_dist {
+                                            best_dist = dist;
+                                            best_idx = idx;
+                                        }
                                     }
                                 }
 
@@ -174,6 +502,7 @@ macro_rules! impl_simd_backend {
                     out_distances: Option<&mut [$scalar]>,
                 ) {
                     let num_chunks = k.div_ceil(SIMD_WIDTH);
+                    let all_lanes_valid = k == num_chunks * SIMD_WIDTH;
 
                     let mut current_indices_arr: [$idx_scalar; SIMD_WIDTH] = [0; SIMD_WIDTH];
                     for (i, slot) in current_indices_arr.iter_mut().enumerate() {
@@ -232,11 +561,20 @@ macro_rules! impl_simd_backend {
                                 let mut best_idx = 0;
                                 let mut best_dot = <$scalar>::NEG_INFINITY;
 
-                                for (&dot, &idx_val) in dots.iter().zip(indices.iter()) {
-                                    let idx = idx_val as usize;
-                                    if idx < k && dot > best_dot {
-                                        best_dot = dot;
-                                        best_idx = idx;
+                                if all_lanes_valid {
+                                    for (&dot, &idx_val) in dots.iter().zip(indices.iter()) {
+                                        if dot > best_dot {
+                                            best_dot = dot;
+                                            best_idx = idx_val as usize;
+                                        }
+                                    }
+                                } else {
+                                    for (&dot, &idx_val) in dots.iter().zip(indices.iter()) {
+                                        let idx = idx_val as usize;
+                                        if idx < k && dot > best_dot {
+                                            best_dot = dot;
+                                            best_idx = idx;
+                                        }
                                     }
                                 }
 
@@ -313,35 +651,48 @@ macro_rules! impl_simd_backend {
                     centroid: &[$scalar],
                     min_dists: &mut [$scalar],
                 ) -> $scalar {
-                    calculate_and_update_min_distance_generic_sum(
-                        points,
-                        ncols,
-                        min_dists,
-                        |point, min_dist| {
-                            let mut sum_vec = SimdVec::ZERO;
-                            let mut j = 0;
+                    const POINT_BATCH: usize = 4;
 
-                            while j + SIMD_WIDTH <= ncols {
+                    let mut total = 0.0;
+                    let mut processed = 0;
+
+                    for points_batch in points.chunks(ncols * POINT_BATCH) {
+                        let batch_size = points_batch.len() / ncols;
+                        let mut sum_vecs = [SimdVec::ZERO; POINT_BATCH];
+                        let mut j = 0;
+
+                        while j + SIMD_WIDTH <= ncols {
+                            let c_vec = load_chunk(centroid, j);
+                            for i in 0..batch_size {
+                                let point = &points_batch[i * ncols..(i + 1) * ncols];
                                 let p_vec = load_chunk(point, j);
-                                let c_vec = load_chunk(centroid, j);
                                 let diff = p_vec - c_vec;
-                                sum_vec += diff * diff;
-                                j += SIMD_WIDTH;
+                                sum_vecs[i] += diff * diff;
                             }
+                            j += SIMD_WIDTH;
+                        }
 
-                            let mut d = sum_vec.reduce_add();
-
-                            while j < ncols {
-                                let diff = point[j] - centroid[j];
+                        for i in 0..batch_size {
+                            let point = &points_batch[i * ncols..(i + 1) * ncols];
+                            let mut d = sum_vecs[i].reduce_add();
+                            let mut tail = j;
+                            while tail < ncols {
+                                let diff = point[tail] - centroid[tail];
                                 d += diff * diff;
-                                j += 1;
+                                tail += 1;
                             }
 
+                            let min_dist = &mut min_dists[processed + i];
                             if d < *min_dist {
                                 *min_dist = d;
                             }
-                        },
-                    )
+                            total += *min_dist;
+                        }
+
+                        processed += batch_size;
+                    }
+
+                    total
                 }
 
                 fn calculate_and_update_min_distance_dot(
@@ -449,15 +800,17 @@ macro_rules! impl_simd_backend {
             }
 
             #[inline(always)]
-            fn update_centroids_impl<S: PointSource<$scalar>>(
+            fn update_centroids_impl<const TRACK_SHIFT: bool, S: PointSource<$scalar>>(
                 packed_centroids: &mut [$scalar],
                 sums: &[$scalar],
                 counts: &[usize],
                 source: &S,
                 ncols: usize,
                 rng: &mut impl Rng,
-            ) {
+            ) -> $scalar {
                 let num_chunks = counts.len().div_ceil(SIMD_WIDTH);
+                let npoints = source.num_points();
+                let mut max_shift: $scalar = 0.0;
 
                 // Single buffer reused for all zero samples (avoids many allocations)
                 let mut zero_samples: Vec<$scalar> = vec![0.0; SIMD_WIDTH * ncols];
@@ -479,8 +832,8 @@ macro_rules! impl_simd_backend {
                         if counts[k_idx] > 0 {
                             inv_counts[lane] = 1.0 / <$scalar>::from_usize(counts[k_idx]);
                             active_mask[lane] = true;
-                        } else if source.num_points() > 0 {
-                            zero_indices[lane] = rng.random_range(0..source.num_points());
+                        } else if npoints > 0 {
+                            zero_indices[lane] = rng.random_range(0..npoints);
                             active_mask[lane] = false;
                         }
                     }
@@ -492,7 +845,7 @@ macro_rules! impl_simd_backend {
                             break;
                         }
 
-                        if counts[k_idx] == 0 && source.num_points() > 0 {
+                        if counts[k_idx] == 0 && npoints > 0 {
                             source.read_batch(
                                 zero_indices[lane],
                                 1,
@@ -530,14 +883,25 @@ macro_rules! impl_simd_backend {
                             }
 
                             let dest_idx = chunk_offset + d * SIMD_WIDTH + lane;
-                            if active_mask[lane] {
-                                packed_centroids[dest_idx] = arr[lane];
-                            } else if counts[k_idx] == 0 && source.num_points() > 0 {
-                                packed_centroids[dest_idx] = zero_samples[lane * ncols + d];
+                            let new_value = if active_mask[lane] {
+                                arr[lane]
+                            } else if counts[k_idx] == 0 && npoints > 0 {
+                                zero_samples[lane * ncols + d]
+                            } else {
+                                packed_centroids[dest_idx]
+                            };
+
+                            if TRACK_SHIFT {
+                                let diff = (packed_centroids[dest_idx] - new_value).abs();
+                                if diff > max_shift {
+                                    max_shift = diff;
+                                }
                             }
+                            packed_centroids[dest_idx] = new_value;
                         }
                     }
                 }
+                max_shift
             }
         }
     };

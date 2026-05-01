@@ -70,28 +70,22 @@ where
 }
 
 #[inline(always)]
-pub fn squared_euclidean<F: Primitive>(a: &[F], b: &[F]) -> F {
-    let mut sum = F::zero();
-    for (x, y) in a.iter().zip(b.iter()) {
-        let diff = *x - *y;
-        sum = sum + diff * diff;
-    }
-    sum
-}
-
-#[inline(always)]
-pub fn dot_product<F: Primitive>(a: &[F], b: &[F]) -> F {
-    let mut sum = F::zero();
-    for (x, y) in a.iter().zip(b.iter()) {
-        sum = sum + *x * *y;
-    }
-    sum
-}
-
-#[inline(always)]
 pub fn calculate_chunk_size<F: Primitive>(ncols: usize) -> usize {
     let bytes_per_point = ncols.saturating_mul(std::mem::size_of::<F>()).max(4);
     let target_bytes = 64 * 1024;
     let points_per_chunk = (target_bytes / bytes_per_point.max(1)).max(1);
+    points_per_chunk.clamp(128, 262_144)
+}
+
+#[inline(always)]
+pub fn calculate_transform_chunk_size<F: Primitive>(ncols: usize, k: usize) -> usize {
+    let elem_size = std::mem::size_of::<F>().max(4);
+    let bytes_per_point = ncols.saturating_mul(elem_size);
+    let bytes_per_output_row = k.saturating_mul(elem_size);
+    let working_set = bytes_per_point
+        .saturating_add(bytes_per_output_row)
+        .max(elem_size);
+    let target_bytes = 128 * 1024;
+    let points_per_chunk = (target_bytes / working_set.max(1)).max(1);
     points_per_chunk.clamp(128, 262_144)
 }

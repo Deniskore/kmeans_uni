@@ -5,7 +5,7 @@ mod error;
 mod kmeans_core;
 mod kmeans_core_common;
 mod kmeans_core_scalar;
-pub mod kmeans_cpu;
+mod kmeans_cpu;
 mod kmeans_mini_batch;
 mod point_source;
 mod primitive;
@@ -13,11 +13,15 @@ mod primitive;
 use backend::CoreBackend;
 use error::Error as KMeansError;
 pub use error::{Error, Result};
-use kmeans_core_common::{calculate_chunk_size, dot_product, squared_euclidean};
+use kmeans_core_common::calculate_chunk_size;
 use kmeans_cpu::run as run_cpu;
+use point_source::view_or_copy_batch;
 pub use point_source::{PointSource, SlicePointSource};
 pub use primitive::Primitive;
+use std::any::TypeId;
+use std::borrow::Cow;
 use std::marker::PhantomData;
+use std::sync::OnceLock;
 
 #[cfg(feature = "wide")]
 mod kmeans_core_simd;
@@ -41,7 +45,7 @@ pub trait BackendType: Send + Sync {}
 impl BackendType for CPUScalar {}
 
 pub trait CpuBackendType<F: Primitive>: BackendType {
-    type Core: backend::CoreBackend<F>;
+    type Core: backend::CoreBackend<F> + 'static;
 }
 
 impl<F: Primitive> CpuBackendType<F> for CPUScalar {
@@ -86,8 +90,59 @@ impl<F: Primitive> AlgorithmType<F> for DotProduct {
 
 pub use kmeans_core::{InitializationStrategy, KMeansPlusPlus};
 
+#[derive(Debug)]
+struct PreparedCentroidCache<F> {
+    scalar: OnceLock<Vec<F>>,
+    default: OnceLock<Vec<F>>,
+}
+
+impl<F> Default for PreparedCentroidCache<F> {
+    fn default() -> Self {
+        Self {
+            scalar: OnceLock::new(),
+            default: OnceLock::new(),
+        }
+    }
+}
+
+impl<F: Primitive> PreparedCentroidCache<F> {
+    #[inline]
+    fn get_for_backend<'a, B: CpuBackendType<F>>(
+        &'a self,
+        centroids: &[F],
+        ncols: usize,
+        k: usize,
+    ) -> Cow<'a, [F]> {
+        let core_id = TypeId::of::<B::Core>();
+
+        if core_id == TypeId::of::<kmeans_core_scalar::ScalarBackend>() {
+            return Cow::Borrowed(
+                self.scalar
+                    .get_or_init(|| {
+                        kmeans_core_scalar::ScalarBackend::prepare_centroids(centroids, ncols, k)
+                    })
+                    .as_slice(),
+            );
+        }
+
+        if core_id == TypeId::of::<<F::DefaultInferenceBackend as CpuBackendType<F>>::Core>() {
+            return Cow::Borrowed(
+                self.default
+                    .get_or_init(|| {
+                        <F::DefaultInferenceBackend as CpuBackendType<F>>::Core::prepare_centroids(
+                            centroids, ncols, k,
+                        )
+                    })
+                    .as_slice(),
+            );
+        }
+
+        Cow::Owned(B::Core::prepare_centroids(centroids, ncols, k))
+    }
+}
+
 /// A trained K-Means model.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct KMeans<F: Primitive> {
     /// The cluster centers (centroids).
@@ -100,6 +155,21 @@ pub struct KMeans<F: Primitive> {
     inertia: F,
     /// Metric used during training (controls prediction/transform behavior).
     metric: MetricType,
+    #[cfg_attr(feature = "serde", serde(skip))]
+    prepared_centroid_cache: PreparedCentroidCache<F>,
+}
+
+impl<F: Primitive> Clone for KMeans<F> {
+    fn clone(&self) -> Self {
+        Self {
+            centroids: self.centroids.clone(),
+            ncols: self.ncols,
+            k: self.k,
+            inertia: self.inertia,
+            metric: self.metric,
+            prepared_centroid_cache: PreparedCentroidCache::default(),
+        }
+    }
 }
 
 #[cfg(feature = "serde")]
@@ -167,6 +237,7 @@ impl<F: Primitive> KMeans<F> {
             k,
             inertia,
             metric,
+            prepared_centroid_cache: PreparedCentroidCache::default(),
         })
     }
 
@@ -200,6 +271,108 @@ impl<F: Primitive> KMeans<F> {
         validate_centroid_shape(&self.centroids, self.ncols, self.k)
     }
 
+    #[inline]
+    fn prepared_centroids_for_backend<B: CpuBackendType<F>>(&self) -> Cow<'_, [F]> {
+        self.prepared_centroid_cache
+            .get_for_backend::<B>(&self.centroids, self.ncols, self.k)
+    }
+
+    #[inline(always)]
+    fn assign_labels_chunk_with_backend<B: CpuBackendType<F>>(
+        &self,
+        points: &[F],
+        prepared_centroids: &[F],
+        out_labels: &mut [usize],
+    ) {
+        match self.metric {
+            MetricType::Euclidean => B::Core::find_nearest_centroids_euc(
+                points,
+                self.ncols,
+                prepared_centroids,
+                self.k,
+                out_labels,
+                None,
+            ),
+            MetricType::DotProduct => B::Core::find_nearest_centroids_dot_product(
+                points,
+                self.ncols,
+                prepared_centroids,
+                self.k,
+                out_labels,
+                None,
+            ),
+        }
+    }
+
+    #[inline(always)]
+    fn transform_chunk_with_backend<B: CpuBackendType<F>>(
+        &self,
+        points: &[F],
+        prepared_centroids: &[F],
+        out_scores: &mut [F],
+    ) {
+        match self.metric {
+            MetricType::Euclidean => {
+                B::Core::transform_euc(points, self.ncols, prepared_centroids, self.k, out_scores)
+            }
+            MetricType::DotProduct => {
+                B::Core::transform_dot(points, self.ncols, prepared_centroids, self.k, out_scores)
+            }
+        }
+    }
+
+    fn transform_with_backend_impl<B: CpuBackendType<F>, const PARALLEL: bool>(
+        &self,
+        points: &[F],
+    ) -> Result<Vec<F>> {
+        self.validate_model_shape()?;
+        validate_prediction_inputs(points, self.ncols)?;
+
+        let npoints = points.len() / self.ncols;
+        let mut scores = vec![F::zero(); npoints * self.k];
+        if npoints == 0 {
+            return Ok(scores);
+        }
+
+        let prepared_centroids = self.prepared_centroids_for_backend::<B>();
+        let points_per_chunk = B::Core::transform_points_per_chunk(self.ncols, self.k);
+
+        #[cfg(not(feature = "wasm"))]
+        if PARALLEL {
+            use rayon::prelude::*;
+            scores
+                .par_chunks_mut(points_per_chunk * self.k)
+                .enumerate()
+                .for_each(|(chunk_idx, chunk_scores)| {
+                    let start_point_idx = chunk_idx * points_per_chunk;
+                    let point_count = chunk_scores.len() / self.k;
+                    let chunk_points = &points[start_point_idx * self.ncols
+                        ..(start_point_idx + point_count) * self.ncols];
+                    self.transform_chunk_with_backend::<B>(
+                        chunk_points,
+                        prepared_centroids.as_ref(),
+                        chunk_scores,
+                    );
+                });
+            return Ok(scores);
+        }
+
+        for (chunk_idx, chunk_scores) in scores.chunks_mut(points_per_chunk * self.k).enumerate() {
+            let start_point_idx = chunk_idx * points_per_chunk;
+            let point_count = chunk_scores.len() / self.k;
+            let chunk_points =
+                &points[start_point_idx * self.ncols..(start_point_idx + point_count) * self.ncols];
+
+            self.transform_chunk_with_backend::<B>(
+                chunk_points,
+                prepared_centroids.as_ref(),
+                chunk_scores,
+            );
+        }
+
+        Ok(scores)
+    }
+
     /// Fit with the scalar CPU backend and Euclidean metric using builder defaults.
     ///
     /// # Examples
@@ -215,7 +388,7 @@ impl<F: Primitive> KMeans<F> {
     /// # Notes
     ///
     /// This method assumes that the input `points` contains only finite floating-point values.
-    /// Accessing `NaN` or `Infinity` in the input may result in undefined behavior or
+    /// Accessing `NaN` or `Infinity` in the input may result in invalid results or
     /// failure to produce a model.
     pub fn fit_default_scalar(points: impl AsRef<[F]>, ncols: usize, k: usize) -> Result<Self> {
         KMeansBuilder::new(k)
@@ -226,8 +399,9 @@ impl<F: Primitive> KMeans<F> {
     }
 
     /// Predict the closest cluster for each point in the input data.
+    #[inline(always)]
     pub fn predict(&self, points: impl AsRef<[F]>) -> Result<Vec<usize>> {
-        self.predict_with_backend::<CPUScalar>(points)
+        self.predict_with_backend::<F::DefaultInferenceBackend>(points)
     }
 
     /// Predict using a sequential execution path (no Rayon), useful when thread-pinning or deterministic scheduling is required.
@@ -245,17 +419,17 @@ impl<F: Primitive> KMeans<F> {
     /// # Notes
     ///
     /// This method assumes that the input `points` contains only finite floating-point values.
-    /// Passing `NaN` or `Infinity` in the input may result in undefined behavior or
+    /// Passing `NaN` or `Infinity` in the input may result in invalid or
     /// incorrect predictions.
     pub fn predict_sequential(&self, points: impl AsRef<[F]>) -> Result<Vec<usize>> {
-        self.predict_with_backend_sequential::<CPUScalar>(points)
+        self.predict_with_backend_sequential::<F::DefaultInferenceBackend>(points)
     }
 
     pub fn predict_with_backend<B: CpuBackendType<F>>(
         &self,
         points: impl AsRef<[F]>,
     ) -> Result<Vec<usize>> {
-        self.predict_with_backend_mode::<B>(points, true)
+        self.predict_with_backend_impl::<B>(points, true)
     }
 
     /// Predict with an explicit sequential mode, bypassing Rayon even on native builds.
@@ -263,10 +437,10 @@ impl<F: Primitive> KMeans<F> {
         &self,
         points: impl AsRef<[F]>,
     ) -> Result<Vec<usize>> {
-        self.predict_with_backend_mode::<B>(points, false)
+        self.predict_with_backend_impl::<B>(points, false)
     }
 
-    fn predict_with_backend_mode<B: CpuBackendType<F>>(
+    fn predict_with_backend_impl<B: CpuBackendType<F>>(
         &self,
         points: impl AsRef<[F]>,
         parallel: bool,
@@ -279,7 +453,7 @@ impl<F: Primitive> KMeans<F> {
         let mut labels = vec![0usize; npoints];
 
         let chunk_size = calculate_chunk_size::<F>(self.ncols);
-        let prepared_centroids = B::Core::prepare_centroids(&self.centroids, self.ncols, self.k);
+        let prepared_centroids = self.prepared_centroids_for_backend::<B>();
         #[cfg(feature = "wasm")]
         let _ = parallel;
 
@@ -293,25 +467,11 @@ impl<F: Primitive> KMeans<F> {
                     let start = chunk_idx * chunk_size;
                     let end = start + chunk_labels.len();
                     let chunk_points = &points[start * self.ncols..end * self.ncols];
-
-                    match self.metric {
-                        MetricType::Euclidean => B::Core::find_nearest_centroids_euc(
-                            chunk_points,
-                            self.ncols,
-                            &prepared_centroids,
-                            self.k,
-                            chunk_labels,
-                            None,
-                        ),
-                        MetricType::DotProduct => B::Core::find_nearest_centroids_dot_product(
-                            chunk_points,
-                            self.ncols,
-                            &prepared_centroids,
-                            self.k,
-                            chunk_labels,
-                            None,
-                        ),
-                    }
+                    self.assign_labels_chunk_with_backend::<B>(
+                        chunk_points,
+                        prepared_centroids.as_ref(),
+                        chunk_labels,
+                    );
                 });
 
             return Ok(labels);
@@ -323,25 +483,11 @@ impl<F: Primitive> KMeans<F> {
                 let start = chunk_idx * chunk_size;
                 let end = start + chunk_labels.len();
                 let chunk_points = &points[start * self.ncols..end * self.ncols];
-
-                match self.metric {
-                    MetricType::Euclidean => B::Core::find_nearest_centroids_euc(
-                        chunk_points,
-                        self.ncols,
-                        &prepared_centroids,
-                        self.k,
-                        chunk_labels,
-                        None,
-                    ),
-                    MetricType::DotProduct => B::Core::find_nearest_centroids_dot_product(
-                        chunk_points,
-                        self.ncols,
-                        &prepared_centroids,
-                        self.k,
-                        chunk_labels,
-                        None,
-                    ),
-                }
+                self.assign_labels_chunk_with_backend::<B>(
+                    chunk_points,
+                    prepared_centroids.as_ref(),
+                    chunk_labels,
+                );
             }
         }
 
@@ -350,7 +496,7 @@ impl<F: Primitive> KMeans<F> {
 
     /// Predict the closest cluster for each point in the input source.
     pub fn predict_from_source<S: PointSource<F>>(&self, source: &S) -> Result<Vec<usize>> {
-        self.predict_from_source_with_backend::<CPUScalar, _>(source)
+        self.predict_from_source_with_backend::<F::DefaultInferenceBackend, _>(source)
     }
 
     /// Predict the closest cluster for each point in the input source using a specific backend.
@@ -358,42 +504,76 @@ impl<F: Primitive> KMeans<F> {
         &self,
         source: &S,
     ) -> Result<Vec<usize>> {
+        self.predict_from_source_with_backend_impl::<B, S>(source, true)
+    }
+
+    fn predict_from_source_with_backend_impl<B: CpuBackendType<F>, S: PointSource<F>>(
+        &self,
+        source: &S,
+        parallel: bool,
+    ) -> Result<Vec<usize>> {
         self.validate_model_shape()?;
         validate_prediction_source_inputs(source, self.ncols)?;
         let npoints = source.num_points();
         let mut labels = vec![0usize; npoints];
 
         // Use backend-prepared centroids for cache-friendly access (e.g., SIMD packing)
-        let prepared_centroids = B::Core::prepare_centroids(&self.centroids, self.ncols, self.k);
+        let prepared_centroids = self.prepared_centroids_for_backend::<B>();
 
-        // Chunk size scales with dimensionality
+        // Chunk size scales with dimensionality.
+        // Keep a fallback copy buffer only for non-contiguous sources.
         let chunk_size = calculate_chunk_size::<F>(self.ncols);
-        let mut buffer = vec![F::zero(); chunk_size * self.ncols];
+        #[cfg(feature = "wasm")]
+        let _ = parallel;
 
+        #[cfg(not(feature = "wasm"))]
+        if parallel {
+            use rayon::prelude::*;
+            labels
+                .par_chunks_mut(chunk_size)
+                .enumerate()
+                .try_for_each_init(
+                    || None::<Vec<F>>,
+                    |fallback_buffer, (chunk_idx, label_slice)| -> Result<()> {
+                        let start = chunk_idx * chunk_size;
+                        let count = label_slice.len();
+                        let point_slice = view_or_copy_batch(
+                            source,
+                            fallback_buffer,
+                            start,
+                            count,
+                            chunk_size,
+                            self.ncols,
+                        )?;
+                        self.assign_labels_chunk_with_backend::<B>(
+                            point_slice,
+                            prepared_centroids.as_ref(),
+                            label_slice,
+                        );
+                        Ok(())
+                    },
+                )?;
+            return Ok(labels);
+        }
+
+        let mut fallback_buffer: Option<Vec<F>> = None;
         let mut processed = 0;
         while processed < npoints {
             let current_chunk_size = std::cmp::min(chunk_size, npoints - processed);
-            let chunk_buffer = &mut buffer[..current_chunk_size * self.ncols];
-            source.read_batch(processed, current_chunk_size, chunk_buffer);
-
-            match self.metric {
-                MetricType::Euclidean => B::Core::find_nearest_centroids_euc(
-                    chunk_buffer,
-                    self.ncols,
-                    &prepared_centroids,
-                    self.k,
-                    &mut labels[processed..processed + current_chunk_size],
-                    None,
-                ),
-                MetricType::DotProduct => B::Core::find_nearest_centroids_dot_product(
-                    chunk_buffer,
-                    self.ncols,
-                    &prepared_centroids,
-                    self.k,
-                    &mut labels[processed..processed + current_chunk_size],
-                    None,
-                ),
-            }
+            let label_slice = &mut labels[processed..processed + current_chunk_size];
+            let point_slice = view_or_copy_batch(
+                source,
+                &mut fallback_buffer,
+                processed,
+                current_chunk_size,
+                chunk_size,
+                self.ncols,
+            )?;
+            self.assign_labels_chunk_with_backend::<B>(
+                point_slice,
+                prepared_centroids.as_ref(),
+                label_slice,
+            );
 
             processed += current_chunk_size;
         }
@@ -409,87 +589,31 @@ impl<F: Primitive> KMeans<F> {
     /// # Notes
     ///
     /// This method assumes that the input `points` contains only finite floating-point values.
-    /// Passing `NaN` or `Infinity` in the input may result in undefined behavior or
+    /// Passing `NaN` or `Infinity` in the input may result in invalid or
     /// incorrect results.
     pub fn transform(&self, points: impl AsRef<[F]>) -> Result<Vec<F>> {
-        self.validate_model_shape()?;
-        let points = points.as_ref();
-        validate_prediction_inputs(points, self.ncols)?;
+        self.transform_with_backend::<F::DefaultInferenceBackend>(points)
+    }
 
-        let npoints = points.len() / self.ncols;
-        let mut distances = vec![F::zero(); npoints * self.k];
-
-        let chunk_size = calculate_chunk_size::<F>(self.ncols);
-
+    pub fn transform_with_backend<B: CpuBackendType<F>>(
+        &self,
+        points: impl AsRef<[F]>,
+    ) -> Result<Vec<F>> {
         #[cfg(not(feature = "wasm"))]
         {
-            use rayon::prelude::*;
-            distances
-                .par_chunks_mut(chunk_size * self.k)
-                .enumerate()
-                .for_each(|(chunk_idx, chunk_dists)| {
-                    let start_point_idx = chunk_idx * chunk_size;
-                    let num_points_in_chunk = chunk_dists.len() / self.k;
-
-                    for i in 0..num_points_in_chunk {
-                        let point_idx = start_point_idx + i;
-                        let point = &points[point_idx * self.ncols..(point_idx + 1) * self.ncols];
-
-                        match self.metric {
-                            MetricType::Euclidean => {
-                                for c in 0..self.k {
-                                    let centroid =
-                                        &self.centroids[c * self.ncols..(c + 1) * self.ncols];
-                                    let dist = squared_euclidean(point, centroid);
-                                    chunk_dists[i * self.k + c] = dist;
-                                }
-                            }
-                            MetricType::DotProduct => {
-                                for c in 0..self.k {
-                                    let centroid =
-                                        &self.centroids[c * self.ncols..(c + 1) * self.ncols];
-                                    let dot = dot_product(point, centroid);
-                                    chunk_dists[i * self.k + c] = dot;
-                                }
-                            }
-                        }
-                    }
-                });
+            self.transform_with_backend_impl::<B, true>(points.as_ref())
         }
-
         #[cfg(feature = "wasm")]
         {
-            for (chunk_idx, chunk_dists) in distances.chunks_mut(chunk_size * self.k).enumerate() {
-                let start_point_idx = chunk_idx * chunk_size;
-                let num_points_in_chunk = chunk_dists.len() / self.k;
-
-                for i in 0..num_points_in_chunk {
-                    let point_idx = start_point_idx + i;
-                    let point = &points[point_idx * self.ncols..(point_idx + 1) * self.ncols];
-
-                    match self.metric {
-                        MetricType::Euclidean => {
-                            for c in 0..self.k {
-                                let centroid =
-                                    &self.centroids[c * self.ncols..(c + 1) * self.ncols];
-                                let dist = squared_euclidean(point, centroid);
-                                chunk_dists[i * self.k + c] = dist;
-                            }
-                        }
-                        MetricType::DotProduct => {
-                            for c in 0..self.k {
-                                let centroid =
-                                    &self.centroids[c * self.ncols..(c + 1) * self.ncols];
-                                let dot = dot_product(point, centroid);
-                                chunk_dists[i * self.k + c] = dot;
-                            }
-                        }
-                    }
-                }
-            }
+            self.transform_with_backend_impl::<B, false>(points.as_ref())
         }
+    }
 
-        Ok(distances)
+    pub fn transform_with_backend_sequential<B: CpuBackendType<F>>(
+        &self,
+        points: impl AsRef<[F]>,
+    ) -> Result<Vec<F>> {
+        self.transform_with_backend_impl::<B, false>(points.as_ref())
     }
 }
 
@@ -498,14 +622,12 @@ impl KMeans<f32> {
     /// Fit with the SIMD CPU backend (requires `wide` feature) and Euclidean metric.
     ///
     /// # Examples
-    /// ```
-    /// # #[cfg(feature = "wide")] {
+    /// ```ignore
     /// use kmeans_uni::KMeans;
     ///
     /// let data = [0.0f32, 0.0, 2.0, 2.0];
     /// let model = KMeans::<f32>::fit_default_simd(&data, 2, 2).unwrap();
     /// assert_eq!(model.k(), 2);
-    /// # }
     /// ```
     pub fn fit_default_simd(points: impl AsRef<[f32]>, ncols: usize, k: usize) -> Result<Self> {
         KMeansBuilder::new(k)
@@ -607,8 +729,8 @@ impl<F: Primitive, I: InitializationStrategy> KMeansBuilder<F, BackendNotSet, Al
     /// # Notes
     ///
     /// When calling `fit()` on the resulting config, the input `points` must contain only
-    /// finite floating-point values. Passing `NaN` or `Infinity` may result in undefined
-    /// behavior or failure to produce a valid model.
+    /// finite floating-point values. Passing `NaN` or `Infinity` may result in invalid
+    /// results or failure to produce a valid model.
     #[inline]
     pub fn build_default(self) -> KMeansConfig<F, CPUScalar, Euclidean, false, I> {
         self.cpu_scalar().euclidean().build()

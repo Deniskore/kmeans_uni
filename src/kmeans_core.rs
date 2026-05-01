@@ -1,11 +1,11 @@
-use rand::Rng;
+use rand::{Rng, RngExt};
 #[cfg(not(feature = "wasm"))]
 use rayon::prelude::*;
 
 use crate::Primitive;
 use crate::backend::{CoreBackend, DistanceMetric};
 use crate::kmeans_core_common::calculate_chunk_size;
-use crate::point_source::PointSource;
+use crate::point_source::{PointSource, view_or_copy_batch};
 
 use crate::error::{Error, Result};
 
@@ -93,7 +93,8 @@ pub trait ExecutionStrategy: Send + Sync + 'static {
         newest_centroid: &[F],
         min_dists: &mut [F],
         par_chunk: usize,
-    ) -> Result<Vec<F>>;
+        chunk_sums: &mut [F],
+    ) -> Result<()>;
 }
 
 pub struct Sequential;
@@ -136,41 +137,34 @@ impl ExecutionStrategy for Sequential {
 
         let npoints = source.num_points();
         if npoints == 0 {
-            return Ok((sums, counts, inertia));
+            return Ok((sums, counts, 0.0_f64));
         }
 
         let chunk_size = calculate_chunk_size::<F>(ncols);
-        let mut buffer = vec![F::zero(); chunk_size * ncols];
-        let mut distances = vec![F::zero(); chunk_size];
-        let mut labels = vec![0usize; chunk_size];
+        let mut fallback_buffer = None;
 
         let mut processed = 0;
         while processed < npoints {
             let batch_size = (npoints - processed).min(chunk_size);
-            let slice = &mut buffer[..batch_size * ncols];
-            let batch_labels = &mut labels[..batch_size];
-            let batch_dists = &mut distances[..batch_size];
-
-            source.read_batch(processed, batch_size, slice);
-
-            M::find_nearest::<C>(
-                slice,
+            let points = view_or_copy_batch(
+                source,
+                &mut fallback_buffer,
+                processed,
+                batch_size,
+                chunk_size,
+                ncols,
+            )?;
+            let mut batch_inertia = F::zero();
+            M::assign_and_accumulate::<C>(
+                points,
                 ncols,
                 prepared_centroids,
                 k,
-                batch_labels,
-                Some(batch_dists),
+                &mut sums,
+                &mut counts,
+                &mut batch_inertia,
             );
-
-            for i in 0..batch_size {
-                let best = batch_labels[i];
-                let dist = batch_dists[i];
-                let point = &slice[i * ncols..(i + 1) * ncols];
-
-                counts[best] += 1;
-                C::accumulate_point_slice(point, ncols, &mut sums, best);
-                inertia += dist.to_f64().ok_or(Error::ConversionFailure)?;
-            }
+            inertia += batch_inertia.to_f64().ok_or(Error::ConversionFailure)?;
 
             processed += batch_size;
         }
@@ -197,20 +191,16 @@ impl ExecutionStrategy for Sequential {
 
         let npoints = indices.len();
         if npoints == 0 {
-            return Ok((sums, counts, inertia));
+            return Ok((sums, counts, 0.0_f64));
         }
 
         let chunk_size = calculate_chunk_size::<F>(ncols);
         let mut buffer = vec![F::zero(); chunk_size * ncols];
-        let mut distances = vec![F::zero(); chunk_size];
-        let mut labels = vec![0usize; chunk_size];
 
         let mut processed = 0;
         while processed < npoints {
             let batch_size = (npoints - processed).min(chunk_size);
             let slice = &mut buffer[..batch_size * ncols];
-            let batch_labels = &mut labels[..batch_size];
-            let batch_dists = &mut distances[..batch_size];
 
             let mut current_batch_idx = 0;
             while current_batch_idx < batch_size {
@@ -232,24 +222,17 @@ impl ExecutionStrategy for Sequential {
                 current_batch_idx += run_len;
             }
 
-            M::find_nearest_with_dists::<C>(
+            let mut batch_inertia = F::zero();
+            M::assign_and_accumulate::<C>(
                 slice,
                 ncols,
                 prepared_centroids,
                 k,
-                batch_labels,
-                batch_dists,
+                &mut sums,
+                &mut counts,
+                &mut batch_inertia,
             );
-
-            for i in 0..batch_size {
-                let best = batch_labels[i];
-                let dist = batch_dists[i];
-                let point = &slice[i * ncols..(i + 1) * ncols];
-
-                counts[best] += 1;
-                C::accumulate_point_slice(point, ncols, &mut sums, best);
-                inertia += dist.to_f64().ok_or(Error::ConversionFailure)?;
-            }
+            inertia += batch_inertia.to_f64().ok_or(Error::ConversionFailure)?;
 
             processed += batch_size;
         }
@@ -268,20 +251,26 @@ impl ExecutionStrategy for Sequential {
         newest_centroid: &[F],
         min_dists: &mut [F],
         _par_chunk: usize,
-    ) -> Result<Vec<F>> {
+        chunk_sums: &mut [F],
+    ) -> Result<()> {
         let npoints = source.num_points();
         let chunk_size = calculate_chunk_size::<F>(ncols);
         let num_chunks = npoints.div_ceil(chunk_size);
-        let mut chunk_sums = vec![F::zero(); num_chunks];
-
-        let mut point_batch = vec![F::zero(); chunk_size * ncols];
+        debug_assert_eq!(chunk_sums.len(), num_chunks);
+        let mut fallback_buffer = None;
 
         let mut offset = 0;
         let mut chunk_idx = 0;
         while offset < npoints {
             let count = (npoints - offset).min(chunk_size);
-            let current_points = &mut point_batch[..count * ncols];
-            source.read_batch(offset, count, current_points);
+            let current_points = view_or_copy_batch(
+                source,
+                &mut fallback_buffer,
+                offset,
+                count,
+                chunk_size,
+                ncols,
+            )?;
 
             let chunk_sum = M::calculate_and_update_min_distance_sum::<C>(
                 current_points,
@@ -294,7 +283,7 @@ impl ExecutionStrategy for Sequential {
             offset += count;
             chunk_idx += 1;
         }
-        Ok(chunk_sums)
+        Ok(())
     }
 }
 
@@ -337,56 +326,72 @@ impl ExecutionStrategy for Parallel {
 
         let res = (0..num_chunks)
             .into_par_iter()
-            .map(|chunk_idx| {
-                let start = chunk_idx * par_chunk;
-                let end = (start + par_chunk).min(npoints);
-                let len = end - start;
-
-                let mut local_sums = vec![F::zero(); k * ncols];
-                let mut local_counts = vec![0usize; k];
-                let mut local_inertia = 0.0_f64;
-
-                let mut buffer = vec![F::zero(); len * ncols];
-                let mut labels = vec![0usize; len];
-                let mut distances = vec![F::zero(); len];
-
-                source.read_batch(start, len, &mut buffer);
-
-                M::find_nearest::<C>(
-                    &buffer,
-                    ncols,
-                    prepared_centroids,
-                    k,
-                    &mut labels,
-                    Some(&mut distances),
-                );
-
-                for i in 0..len {
-                    let best = labels[i];
-                    let dist = distances[i];
-                    let point = &buffer[i * ncols..(i + 1) * ncols];
-
-                    local_counts[best] += 1;
-                    C::accumulate_point_slice(point, ncols, &mut local_sums, best);
-                    local_inertia += dist.to_f64().ok_or(Error::ConversionFailure)?;
-                }
-
-                Ok((local_sums, local_counts, local_inertia))
-            })
-            .reduce(
-                || Ok((vec![F::zero(); k * ncols], vec![0usize; k], 0.0_f64)),
-                |a, b| {
-                    let (mut sums_a, mut counts_a, inertia_a) = a?;
-                    let (sums_b, counts_b, inertia_b) = b?;
-                    for i in 0..sums_a.len() {
-                        sums_a[i] = sums_a[i] + sums_b[i];
-                    }
-                    for i in 0..counts_a.len() {
-                        counts_a[i] += counts_b[i];
-                    }
-                    Ok((sums_a, counts_a, inertia_a + inertia_b))
+            .fold(
+                || {
+                    Ok((
+                        None::<Vec<F>>,
+                        vec![F::zero(); k * ncols],
+                        vec![0usize; k],
+                        0.0_f64,
+                    ))
                 },
-            )?;
+                |acc, chunk_idx| {
+                    let (mut fallback_buffer, mut local_sums, mut local_counts, local_inertia) =
+                        acc?;
+                    let start = chunk_idx * par_chunk;
+                    let end = (start + par_chunk).min(npoints);
+                    let len = end - start;
+
+                    let points = view_or_copy_batch(
+                        source,
+                        &mut fallback_buffer,
+                        start,
+                        len,
+                        par_chunk,
+                        ncols,
+                    )?;
+
+                    let mut chunk_inertia = F::zero();
+                    M::assign_and_accumulate::<C>(
+                        points,
+                        ncols,
+                        prepared_centroids,
+                        k,
+                        &mut local_sums,
+                        &mut local_counts,
+                        &mut chunk_inertia,
+                    );
+
+                    Ok((
+                        fallback_buffer,
+                        local_sums,
+                        local_counts,
+                        local_inertia + chunk_inertia.to_f64().ok_or(Error::ConversionFailure)?,
+                    ))
+                },
+            )
+            .reduce(
+                || {
+                    Ok((
+                        None::<Vec<F>>,
+                        vec![F::zero(); k * ncols],
+                        vec![0usize; k],
+                        0.0_f64,
+                    ))
+                },
+                |a, b| {
+                    let (_fallback_a, mut sums_a, mut counts_a, inertia_a) = a?;
+                    let (_fallback_b, sums_b, counts_b, inertia_b) = b?;
+                    for (sum_a, sum_b) in sums_a.iter_mut().zip(sums_b) {
+                        *sum_a = *sum_a + sum_b;
+                    }
+                    for (count_a, count_b) in counts_a.iter_mut().zip(counts_b) {
+                        *count_a += count_b;
+                    }
+                    Ok((None, sums_a, counts_a, inertia_a + inertia_b))
+                },
+            )
+            .map(|(_, sums, counts, inertia)| (sums, counts, inertia))?;
 
         Ok(res)
     }
@@ -414,69 +419,80 @@ impl ExecutionStrategy for Parallel {
 
         let res = (0..num_chunks)
             .into_par_iter()
-            .map(|chunk_idx| {
-                let start = chunk_idx * par_chunk;
-                let end = (start + par_chunk).min(npoints);
-                let len = end - start;
-
-                let mut local_sums = vec![F::zero(); k * ncols];
-                let mut local_counts = vec![0usize; k];
-                let mut local_inertia = 0.0_f64;
-
-                let mut buffer = vec![F::zero(); len * ncols];
-                let mut labels = vec![0usize; len];
-                let mut distances = vec![F::zero(); len];
-
-                let chunk_indices = &indices[start..end];
-                let mut current_idx = 0;
-                while current_idx < len {
-                    let start_idx = chunk_indices[current_idx];
-                    let mut run_end = current_idx + 1;
-                    while run_end < len && chunk_indices[run_end] == chunk_indices[run_end - 1] + 1
-                    {
-                        run_end += 1;
-                    }
-                    let run_len = run_end - current_idx;
-                    let slice = &mut buffer[current_idx * ncols..(current_idx + run_len) * ncols];
-                    source.read_batch(start_idx, run_len, slice);
-                    current_idx = run_end;
-                }
-
-                M::find_nearest_with_dists::<C>(
-                    &buffer,
-                    ncols,
-                    prepared_centroids,
-                    k,
-                    &mut labels,
-                    &mut distances,
-                );
-
-                for i in 0..len {
-                    let best = labels[i];
-                    let dist = distances[i];
-                    let point = &buffer[i * ncols..(i + 1) * ncols];
-
-                    local_counts[best] += 1;
-                    C::accumulate_point_slice(point, ncols, &mut local_sums, best);
-                    local_inertia += dist.to_f64().ok_or(Error::ConversionFailure)?;
-                }
-
-                Ok((local_sums, local_counts, local_inertia))
-            })
-            .reduce(
-                || Ok((vec![F::zero(); k * ncols], vec![0usize; k], 0.0_f64)),
-                |a, b| {
-                    let (mut sums_a, mut counts_a, inertia_a) = a?;
-                    let (sums_b, counts_b, inertia_b) = b?;
-                    for i in 0..sums_a.len() {
-                        sums_a[i] = sums_a[i] + sums_b[i];
-                    }
-                    for i in 0..counts_a.len() {
-                        counts_a[i] += counts_b[i];
-                    }
-                    Ok((sums_a, counts_a, inertia_a + inertia_b))
+            .fold(
+                || {
+                    Ok((
+                        vec![F::zero(); par_chunk * ncols],
+                        vec![F::zero(); k * ncols],
+                        vec![0usize; k],
+                        0.0_f64,
+                    ))
                 },
-            )?;
+                |acc, chunk_idx| -> Result<_> {
+                    let (mut buffer, mut local_sums, mut local_counts, local_inertia) = acc?;
+                    let start = chunk_idx * par_chunk;
+                    let end = (start + par_chunk).min(npoints);
+                    let len = end - start;
+                    let chunk_buffer = &mut buffer[..len * ncols];
+
+                    let chunk_indices = &indices[start..end];
+                    let mut current_idx = 0;
+                    while current_idx < len {
+                        let start_idx = chunk_indices[current_idx];
+                        let mut run_end = current_idx + 1;
+                        while run_end < len
+                            && chunk_indices[run_end] == chunk_indices[run_end - 1] + 1
+                        {
+                            run_end += 1;
+                        }
+                        let run_len = run_end - current_idx;
+                        let slice =
+                            &mut chunk_buffer[current_idx * ncols..(current_idx + run_len) * ncols];
+                        source.read_batch(start_idx, run_len, slice);
+                        current_idx = run_end;
+                    }
+
+                    let mut chunk_inertia = F::zero();
+                    M::assign_and_accumulate::<C>(
+                        chunk_buffer,
+                        ncols,
+                        prepared_centroids,
+                        k,
+                        &mut local_sums,
+                        &mut local_counts,
+                        &mut chunk_inertia,
+                    );
+
+                    Ok((
+                        buffer,
+                        local_sums,
+                        local_counts,
+                        local_inertia + chunk_inertia.to_f64().ok_or(Error::ConversionFailure)?,
+                    ))
+                },
+            )
+            .reduce(
+                || {
+                    Ok((
+                        vec![F::zero(); par_chunk * ncols],
+                        vec![F::zero(); k * ncols],
+                        vec![0usize; k],
+                        0.0_f64,
+                    ))
+                },
+                |a, b| {
+                    let (_buffer_a, mut sums_a, mut counts_a, inertia_a) = a?;
+                    let (_buffer_b, sums_b, counts_b, inertia_b) = b?;
+                    for (sum_a, sum_b) in sums_a.iter_mut().zip(sums_b) {
+                        *sum_a = *sum_a + sum_b;
+                    }
+                    for (count_a, count_b) in counts_a.iter_mut().zip(counts_b) {
+                        *count_a += count_b;
+                    }
+                    Ok((Vec::new(), sums_a, counts_a, inertia_a + inertia_b))
+                },
+            )
+            .map(|(_, sums, counts, inertia)| (sums, counts, inertia))?;
 
         Ok(res)
     }
@@ -492,26 +508,26 @@ impl ExecutionStrategy for Parallel {
         newest_centroid: &[F],
         min_dists: &mut [F],
         par_chunk: usize,
-    ) -> Result<Vec<F>> {
+        chunk_sums: &mut [F],
+    ) -> Result<()> {
         let npoints = source.num_points();
         if npoints == 0 {
-            return Ok(Vec::new());
+            return Ok(());
         }
         let chunk_size = par_chunk.clamp(1, npoints);
         let num_chunks = npoints.div_ceil(chunk_size);
-        let mut chunk_sums = vec![F::zero(); num_chunks];
+        debug_assert_eq!(chunk_sums.len(), num_chunks);
 
         chunk_sums
             .par_iter_mut()
             .zip(min_dists.par_chunks_mut(chunk_size).enumerate())
-            .for_each_init(
-                || Vec::new(),
-                |points, (sum_slot, (chunk_idx, min_chunk))| {
+            .try_for_each_init(
+                || None::<Vec<F>>,
+                |fallback_buffer, (sum_slot, (chunk_idx, min_chunk))| -> Result<()> {
                     let start = chunk_idx * chunk_size;
                     let len = min_chunk.len();
-
-                    points.resize(len * ncols, F::zero());
-                    source.read_batch(start, len, points);
+                    let points =
+                        view_or_copy_batch(source, fallback_buffer, start, len, chunk_size, ncols)?;
 
                     let chunk_sum = M::calculate_and_update_min_distance_sum::<C>(
                         points,
@@ -520,10 +536,11 @@ impl ExecutionStrategy for Parallel {
                         min_chunk,
                     );
                     *sum_slot = chunk_sum;
+                    Ok(())
                 },
-            );
+            )?;
 
-        Ok(chunk_sums)
+        Ok(())
     }
 }
 
@@ -580,9 +597,11 @@ pub(crate) fn init_plus_plus_generic<
         return Ok(vec![F::zero(); k * ncols]);
     }
     let chunk_size = calculate_chunk_size::<F>(ncols);
+    let num_chunks = npoints.div_ceil(chunk_size);
 
     let mut centroids = Vec::with_capacity(k * ncols);
     let mut min_dists = vec![F::infinity(); npoints];
+    let mut chunk_sums = vec![F::zero(); num_chunks];
 
     // 1. Choose first centroid uniformly at random
     let first_idx = rng.random_range(0..npoints);
@@ -593,12 +612,13 @@ pub(crate) fn init_plus_plus_generic<
     for _ in 1..k {
         let newest_centroid = &centroids[(centroids.len() / ncols - 1) * ncols..];
 
-        let chunk_sums = E::update_min_dists::<F, C, M, S>(
+        E::update_min_dists::<F, C, M, S>(
             source,
             ncols,
             newest_centroid,
             &mut min_dists,
             chunk_size,
+            &mut chunk_sums,
         )?;
 
         let sum_sq_dist = chunk_sums.iter().copied().fold(F::zero(), |a, b| a + b);
@@ -609,8 +629,12 @@ pub(crate) fn init_plus_plus_generic<
             source.read_batch(next_idx, 1, &mut point_buf);
             centroids.extend_from_slice(&point_buf);
         } else {
-            let target =
-                F::from(rng.random::<f32>()).ok_or(Error::ConversionFailure)? * sum_sq_dist;
+            let sample = if std::mem::size_of::<F>() == std::mem::size_of::<f64>() {
+                F::from(rng.random::<f64>()).ok_or(Error::ConversionFailure)?
+            } else {
+                F::from(rng.random::<f32>()).ok_or(Error::ConversionFailure)?
+            };
+            let target = sample * sum_sq_dist;
             let selected_idx =
                 pick_weighted_index(target, &chunk_sums, chunk_size, &min_dists, npoints);
             source.read_batch(selected_idx, 1, &mut point_buf);
