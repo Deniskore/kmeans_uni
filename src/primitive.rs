@@ -2,7 +2,17 @@ use crate::CpuBackendType;
 use num_traits::Float;
 use std::fmt::Debug;
 
-pub trait Primitive: Float + Debug + Send + Sync + 'static {
+mod sealed {
+    pub trait Sealed {}
+
+    impl Sealed for f32 {}
+    impl Sealed for f64 {}
+}
+
+/// Supported floating point type for K-Means data.
+///
+/// This trait is sealed and currently implemented for `f32` and `f64`.
+pub trait Primitive: sealed::Sealed + Float + Debug + Send + Sync + 'static {
     type DefaultInferenceBackend: CpuBackendType<Self>;
 
     /// Converts a `usize` to this primitive type.

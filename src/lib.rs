@@ -18,6 +18,7 @@ use kmeans_cpu::run as run_cpu;
 use point_source::view_or_copy_batch;
 pub use point_source::{PointSource, SlicePointSource};
 pub use primitive::Primitive;
+use std::any::TypeId;
 use std::borrow::Cow;
 use std::marker::PhantomData;
 use std::sync::OnceLock;
@@ -44,7 +45,7 @@ pub trait BackendType: Send + Sync {}
 impl BackendType for CPUScalar {}
 
 pub trait CpuBackendType<F: Primitive>: BackendType {
-    type Core: backend::CoreBackend<F>;
+    type Core: backend::CoreBackend<F> + 'static;
 }
 
 impl<F: Primitive> CpuBackendType<F> for CPUScalar {
@@ -89,7 +90,7 @@ impl<F: Primitive> AlgorithmType<F> for DotProduct {
 
 pub use kmeans_core::{InitializationStrategy, KMeansPlusPlus};
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct PreparedCentroidCache<F> {
     scalar: OnceLock<Vec<F>>,
     default: OnceLock<Vec<F>>,
@@ -112,9 +113,9 @@ impl<F: Primitive> PreparedCentroidCache<F> {
         ncols: usize,
         k: usize,
     ) -> Cow<'a, [F]> {
-        let core_name = std::any::type_name::<B::Core>();
+        let core_id = TypeId::of::<B::Core>();
 
-        if core_name == std::any::type_name::<kmeans_core_scalar::ScalarBackend>() {
+        if core_id == TypeId::of::<kmeans_core_scalar::ScalarBackend>() {
             return Cow::Borrowed(
                 self.scalar
                     .get_or_init(|| {
@@ -124,9 +125,7 @@ impl<F: Primitive> PreparedCentroidCache<F> {
             );
         }
 
-        if core_name
-            == std::any::type_name::<<F::DefaultInferenceBackend as CpuBackendType<F>>::Core>()
-        {
+        if core_id == TypeId::of::<<F::DefaultInferenceBackend as CpuBackendType<F>>::Core>() {
             return Cow::Borrowed(
                 self.default
                     .get_or_init(|| {
@@ -143,7 +142,7 @@ impl<F: Primitive> PreparedCentroidCache<F> {
 }
 
 /// A trained K-Means model.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct KMeans<F: Primitive> {
     /// The cluster centers (centroids).
@@ -158,6 +157,19 @@ pub struct KMeans<F: Primitive> {
     metric: MetricType,
     #[cfg_attr(feature = "serde", serde(skip))]
     prepared_centroid_cache: PreparedCentroidCache<F>,
+}
+
+impl<F: Primitive> Clone for KMeans<F> {
+    fn clone(&self) -> Self {
+        Self {
+            centroids: self.centroids.clone(),
+            ncols: self.ncols,
+            k: self.k,
+            inertia: self.inertia,
+            metric: self.metric,
+            prepared_centroid_cache: PreparedCentroidCache::default(),
+        }
+    }
 }
 
 #[cfg(feature = "serde")]

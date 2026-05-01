@@ -9,6 +9,11 @@
 - Added broader tests for copy-only sources and scalar/SIMD prediction and transform parity.
 - Split benchmarks into focused modules for initialization, full fitting, mini-batch fitting, prediction, transform, and shape coverage.
 
+### Changed
+
+- `Primitive` is now sealed to the supported `f32`/`f64` types and includes a default inference backend associated type used by prediction and transform.
+- Hid the internal `kmeans_cpu` module from the public API; supported entry points remain `KMeans`, `KMeansBuilder`, and `KMeansConfig`.
+
 ### Maintenance
 
 - Updated dependencies.
