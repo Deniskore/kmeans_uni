@@ -10,6 +10,14 @@ pub trait PointSource<F: Primitive>: Send + Sync {
     fn num_points(&self) -> usize;
     fn num_columns(&self) -> usize;
 
+    /// Returns whether this source can provide contiguous batch views via `view_batch`.
+    ///
+    /// Copy-only sources can override this to `false` to let callers skip a failed
+    /// `view_batch` probe on every chunk and fall back directly to `read_batch`.
+    fn supports_view_batch(&self) -> bool {
+        true
+    }
+
     /// Return a contiguous slice for `count` points starting at `start`.
     fn view_batch(&self, start: usize, count: usize) -> Result<&[F]>;
 
@@ -27,6 +35,28 @@ pub trait PointSource<F: Primitive>: Send + Sync {
     fn read_point(&self, index: usize, dst: &mut [F]) {
         self.read_batch(index, 1, dst);
     }
+}
+
+#[inline]
+pub(crate) fn view_or_copy_batch<'a, F: Primitive, S: PointSource<F>>(
+    source: &'a S,
+    fallback_buffer: &'a mut Option<Vec<F>>,
+    start: usize,
+    count: usize,
+    chunk_capacity: usize,
+    ncols: usize,
+) -> Result<&'a [F]> {
+    if source.supports_view_batch()
+        && let Ok(view) = source.view_batch(start, count)
+    {
+        return Ok(view);
+    }
+
+    let buffer = fallback_buffer
+        .get_or_insert_with(|| vec![F::zero(); chunk_capacity.saturating_mul(ncols)]);
+    let batch = &mut buffer[..count * ncols];
+    source.read_batch(start, count, batch);
+    Ok(batch)
 }
 
 /// Slice-backed point source with zero-copy views.
