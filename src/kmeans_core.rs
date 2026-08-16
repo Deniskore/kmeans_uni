@@ -46,6 +46,103 @@ impl InitializationStrategy for KMeansPlusPlus {
     }
 }
 
+pub struct IterationScratch<F> {
+    sums: Vec<F>,
+    counts: Vec<usize>,
+    fallback_buffer: Option<Vec<F>>,
+    indexed_buffer: Vec<F>,
+    empty_cluster_buffer: Vec<F>,
+    #[cfg(not(feature = "wasm"))]
+    parallel_workers: Vec<ParallelIterationScratch<F>>,
+}
+
+#[cfg(not(feature = "wasm"))]
+struct ParallelIterationScratch<F> {
+    sums: Vec<F>,
+    counts: Vec<usize>,
+    inertia: f64,
+    fallback_buffer: Option<Vec<F>>,
+    indexed_buffer: Vec<F>,
+}
+
+impl<F: Primitive> IterationScratch<F> {
+    pub(crate) fn new(k: usize, ncols: usize) -> Self {
+        Self {
+            sums: vec![F::zero(); k * ncols],
+            counts: vec![0; k],
+            fallback_buffer: None,
+            indexed_buffer: Vec::new(),
+            empty_cluster_buffer: Vec::new(),
+            #[cfg(not(feature = "wasm"))]
+            parallel_workers: Vec::new(),
+        }
+    }
+
+    #[inline]
+    fn reset_totals(&mut self) {
+        self.sums.fill(F::zero());
+        self.counts.fill(0);
+    }
+
+    #[inline]
+    pub(crate) fn sums(&self) -> &[F] {
+        &self.sums
+    }
+
+    #[inline]
+    pub(crate) fn counts(&self) -> &[usize] {
+        &self.counts
+    }
+
+    #[inline]
+    pub(crate) fn centroid_update_parts(&mut self) -> (&[F], &[usize], &mut Vec<F>) {
+        (&self.sums, &self.counts, &mut self.empty_cluster_buffer)
+    }
+
+    #[inline]
+    pub(crate) fn empty_cluster_buffer(&mut self) -> &mut Vec<F> {
+        &mut self.empty_cluster_buffer
+    }
+
+    #[cfg(not(feature = "wasm"))]
+    fn prepare_parallel_workers(&mut self, worker_count: usize, indexed_buffer_len: usize) {
+        while self.parallel_workers.len() < worker_count {
+            self.parallel_workers.push(ParallelIterationScratch {
+                sums: vec![F::zero(); self.sums.len()],
+                counts: vec![0; self.counts.len()],
+                inertia: 0.0,
+                fallback_buffer: None,
+                indexed_buffer: vec![F::zero(); indexed_buffer_len],
+            });
+        }
+
+        for worker in &mut self.parallel_workers[..worker_count] {
+            worker.sums.fill(F::zero());
+            worker.counts.fill(0);
+            worker.inertia = 0.0;
+            if worker.indexed_buffer.len() < indexed_buffer_len {
+                worker.indexed_buffer.resize(indexed_buffer_len, F::zero());
+            }
+        }
+    }
+
+    #[cfg(not(feature = "wasm"))]
+    fn merge_parallel_workers(&mut self, worker_count: usize) -> f64 {
+        self.reset_totals();
+        let mut inertia = 0.0;
+        for worker in &self.parallel_workers[..worker_count] {
+            for (sum, &local_sum) in self.sums.iter_mut().zip(&worker.sums) {
+                *sum = *sum + local_sum;
+            }
+            for (count, &local_count) in self.counts.iter_mut().zip(&worker.counts) {
+                *count += local_count;
+            }
+            inertia += worker.inertia;
+        }
+        inertia
+    }
+}
+
 pub trait ExecutionStrategy: Send + Sync + 'static {
     fn initialize<
         F: Primitive,
@@ -71,7 +168,8 @@ pub trait ExecutionStrategy: Send + Sync + 'static {
         k: usize,
         prepared_centroids: &[F],
         par_chunk: usize,
-    ) -> Result<(Vec<F>, Vec<usize>, f64)>;
+        scratch: &mut IterationScratch<F>,
+    ) -> Result<f64>;
 
     fn compute_stats_indexed<
         F: Primitive,
@@ -85,7 +183,8 @@ pub trait ExecutionStrategy: Send + Sync + 'static {
         prepared_centroids: &[F],
         indices: &[usize],
         par_chunk: usize,
-    ) -> Result<(Vec<F>, Vec<usize>, f64)>;
+        scratch: &mut IterationScratch<F>,
+    ) -> Result<f64>;
 
     fn update_min_dists<F: Primitive, C: CoreBackend<F>, M: DistanceMetric<F>, S: PointSource<F>>(
         source: &S,
@@ -130,25 +229,24 @@ impl ExecutionStrategy for Sequential {
         k: usize,
         prepared_centroids: &[F],
         _par_chunk: usize,
-    ) -> Result<(Vec<F>, Vec<usize>, f64)> {
-        let mut sums = vec![F::zero(); k * ncols];
-        let mut counts = vec![0usize; k];
+        scratch: &mut IterationScratch<F>,
+    ) -> Result<f64> {
+        scratch.reset_totals();
         let mut inertia = 0.0_f64;
 
         let npoints = source.num_points();
         if npoints == 0 {
-            return Ok((sums, counts, 0.0_f64));
+            return Ok(0.0);
         }
 
         let chunk_size = calculate_chunk_size::<F>(ncols);
-        let mut fallback_buffer = None;
 
         let mut processed = 0;
         while processed < npoints {
             let batch_size = (npoints - processed).min(chunk_size);
             let points = view_or_copy_batch(
                 source,
-                &mut fallback_buffer,
+                &mut scratch.fallback_buffer,
                 processed,
                 batch_size,
                 chunk_size,
@@ -160,8 +258,8 @@ impl ExecutionStrategy for Sequential {
                 ncols,
                 prepared_centroids,
                 k,
-                &mut sums,
-                &mut counts,
+                &mut scratch.sums,
+                &mut scratch.counts,
                 &mut batch_inertia,
             );
             inertia += batch_inertia.to_f64().ok_or(Error::ConversionFailure)?;
@@ -169,7 +267,7 @@ impl ExecutionStrategy for Sequential {
             processed += batch_size;
         }
 
-        Ok((sums, counts, inertia))
+        Ok(inertia)
     }
 
     fn compute_stats_indexed<
@@ -184,23 +282,26 @@ impl ExecutionStrategy for Sequential {
         prepared_centroids: &[F],
         indices: &[usize],
         _par_chunk: usize,
-    ) -> Result<(Vec<F>, Vec<usize>, f64)> {
-        let mut sums = vec![F::zero(); k * ncols];
-        let mut counts = vec![0usize; k];
+        scratch: &mut IterationScratch<F>,
+    ) -> Result<f64> {
+        scratch.reset_totals();
         let mut inertia = 0.0_f64;
 
         let npoints = indices.len();
         if npoints == 0 {
-            return Ok((sums, counts, 0.0_f64));
+            return Ok(0.0);
         }
 
         let chunk_size = calculate_chunk_size::<F>(ncols);
-        let mut buffer = vec![F::zero(); chunk_size * ncols];
+        let buffer_len = chunk_size * ncols;
+        if scratch.indexed_buffer.len() < buffer_len {
+            scratch.indexed_buffer.resize(buffer_len, F::zero());
+        }
 
         let mut processed = 0;
         while processed < npoints {
             let batch_size = (npoints - processed).min(chunk_size);
-            let slice = &mut buffer[..batch_size * ncols];
+            let slice = &mut scratch.indexed_buffer[..batch_size * ncols];
 
             let mut current_batch_idx = 0;
             while current_batch_idx < batch_size {
@@ -228,8 +329,8 @@ impl ExecutionStrategy for Sequential {
                 ncols,
                 prepared_centroids,
                 k,
-                &mut sums,
-                &mut counts,
+                &mut scratch.sums,
+                &mut scratch.counts,
                 &mut batch_inertia,
             );
             inertia += batch_inertia.to_f64().ok_or(Error::ConversionFailure)?;
@@ -237,7 +338,7 @@ impl ExecutionStrategy for Sequential {
             processed += batch_size;
         }
 
-        Ok((sums, counts, inertia))
+        Ok(inertia)
     }
 
     fn update_min_dists<
@@ -315,36 +416,33 @@ impl ExecutionStrategy for Parallel {
         k: usize,
         prepared_centroids: &[F],
         par_chunk: usize,
-    ) -> Result<(Vec<F>, Vec<usize>, f64)> {
+        scratch: &mut IterationScratch<F>,
+    ) -> Result<f64> {
         let npoints = source.num_points();
         if npoints == 0 {
-            return Ok((vec![F::zero(); k * ncols], vec![0usize; k], 0.0_f64));
+            scratch.reset_totals();
+            return Ok(0.0);
         }
 
         let par_chunk = par_chunk.min(npoints).max(1);
         let num_chunks = npoints.div_ceil(par_chunk);
+        let worker_count = rayon::current_num_threads().min(num_chunks).max(1);
+        scratch.prepare_parallel_workers(worker_count, 0);
 
-        let res = (0..num_chunks)
-            .into_par_iter()
-            .fold(
-                || {
-                    Ok((
-                        None::<Vec<F>>,
-                        vec![F::zero(); k * ncols],
-                        vec![0usize; k],
-                        0.0_f64,
-                    ))
-                },
-                |acc, chunk_idx| {
-                    let (mut fallback_buffer, mut local_sums, mut local_counts, local_inertia) =
-                        acc?;
+        scratch.parallel_workers[..worker_count]
+            .par_iter_mut()
+            .enumerate()
+            .try_for_each(|(worker_idx, worker)| -> Result<()> {
+                let first_chunk = worker_idx * num_chunks / worker_count;
+                let end_chunk = (worker_idx + 1) * num_chunks / worker_count;
+                for chunk_idx in first_chunk..end_chunk {
                     let start = chunk_idx * par_chunk;
                     let end = (start + par_chunk).min(npoints);
                     let len = end - start;
 
                     let points = view_or_copy_batch(
                         source,
-                        &mut fallback_buffer,
+                        &mut worker.fallback_buffer,
                         start,
                         len,
                         par_chunk,
@@ -357,43 +455,16 @@ impl ExecutionStrategy for Parallel {
                         ncols,
                         prepared_centroids,
                         k,
-                        &mut local_sums,
-                        &mut local_counts,
+                        &mut worker.sums,
+                        &mut worker.counts,
                         &mut chunk_inertia,
                     );
+                    worker.inertia += chunk_inertia.to_f64().ok_or(Error::ConversionFailure)?;
+                }
+                Ok(())
+            })?;
 
-                    Ok((
-                        fallback_buffer,
-                        local_sums,
-                        local_counts,
-                        local_inertia + chunk_inertia.to_f64().ok_or(Error::ConversionFailure)?,
-                    ))
-                },
-            )
-            .reduce(
-                || {
-                    Ok((
-                        None::<Vec<F>>,
-                        vec![F::zero(); k * ncols],
-                        vec![0usize; k],
-                        0.0_f64,
-                    ))
-                },
-                |a, b| {
-                    let (_fallback_a, mut sums_a, mut counts_a, inertia_a) = a?;
-                    let (_fallback_b, sums_b, counts_b, inertia_b) = b?;
-                    for (sum_a, sum_b) in sums_a.iter_mut().zip(sums_b) {
-                        *sum_a = *sum_a + sum_b;
-                    }
-                    for (count_a, count_b) in counts_a.iter_mut().zip(counts_b) {
-                        *count_a += count_b;
-                    }
-                    Ok((None, sums_a, counts_a, inertia_a + inertia_b))
-                },
-            )
-            .map(|(_, sums, counts, inertia)| (sums, counts, inertia))?;
-
-        Ok(res)
+        Ok(scratch.merge_parallel_workers(worker_count))
     }
 
     fn compute_stats_indexed<
@@ -408,32 +479,30 @@ impl ExecutionStrategy for Parallel {
         prepared_centroids: &[F],
         indices: &[usize],
         par_chunk: usize,
-    ) -> Result<(Vec<F>, Vec<usize>, f64)> {
+        scratch: &mut IterationScratch<F>,
+    ) -> Result<f64> {
         let npoints = indices.len();
         if npoints == 0 {
-            return Ok((vec![F::zero(); k * ncols], vec![0usize; k], 0.0_f64));
+            scratch.reset_totals();
+            return Ok(0.0);
         }
 
         let par_chunk = par_chunk.min(npoints).max(1);
         let num_chunks = npoints.div_ceil(par_chunk);
+        let worker_count = rayon::current_num_threads().min(num_chunks).max(1);
+        scratch.prepare_parallel_workers(worker_count, par_chunk * ncols);
 
-        let res = (0..num_chunks)
-            .into_par_iter()
-            .fold(
-                || {
-                    Ok((
-                        vec![F::zero(); par_chunk * ncols],
-                        vec![F::zero(); k * ncols],
-                        vec![0usize; k],
-                        0.0_f64,
-                    ))
-                },
-                |acc, chunk_idx| -> Result<_> {
-                    let (mut buffer, mut local_sums, mut local_counts, local_inertia) = acc?;
+        scratch.parallel_workers[..worker_count]
+            .par_iter_mut()
+            .enumerate()
+            .try_for_each(|(worker_idx, worker)| -> Result<()> {
+                let first_chunk = worker_idx * num_chunks / worker_count;
+                let end_chunk = (worker_idx + 1) * num_chunks / worker_count;
+                for chunk_idx in first_chunk..end_chunk {
                     let start = chunk_idx * par_chunk;
                     let end = (start + par_chunk).min(npoints);
                     let len = end - start;
-                    let chunk_buffer = &mut buffer[..len * ncols];
+                    let chunk_buffer = &mut worker.indexed_buffer[..len * ncols];
 
                     let chunk_indices = &indices[start..end];
                     let mut current_idx = 0;
@@ -458,43 +527,16 @@ impl ExecutionStrategy for Parallel {
                         ncols,
                         prepared_centroids,
                         k,
-                        &mut local_sums,
-                        &mut local_counts,
+                        &mut worker.sums,
+                        &mut worker.counts,
                         &mut chunk_inertia,
                     );
+                    worker.inertia += chunk_inertia.to_f64().ok_or(Error::ConversionFailure)?;
+                }
+                Ok(())
+            })?;
 
-                    Ok((
-                        buffer,
-                        local_sums,
-                        local_counts,
-                        local_inertia + chunk_inertia.to_f64().ok_or(Error::ConversionFailure)?,
-                    ))
-                },
-            )
-            .reduce(
-                || {
-                    Ok((
-                        vec![F::zero(); par_chunk * ncols],
-                        vec![F::zero(); k * ncols],
-                        vec![0usize; k],
-                        0.0_f64,
-                    ))
-                },
-                |a, b| {
-                    let (_buffer_a, mut sums_a, mut counts_a, inertia_a) = a?;
-                    let (_buffer_b, sums_b, counts_b, inertia_b) = b?;
-                    for (sum_a, sum_b) in sums_a.iter_mut().zip(sums_b) {
-                        *sum_a = *sum_a + sum_b;
-                    }
-                    for (count_a, count_b) in counts_a.iter_mut().zip(counts_b) {
-                        *count_a += count_b;
-                    }
-                    Ok((Vec::new(), sums_a, counts_a, inertia_a + inertia_b))
-                },
-            )
-            .map(|(_, sums, counts, inertia)| (sums, counts, inertia))?;
-
-        Ok(res)
+        Ok(scratch.merge_parallel_workers(worker_count))
     }
 
     fn update_min_dists<
@@ -644,3 +686,7 @@ pub(crate) fn init_plus_plus_generic<
 
     Ok(centroids)
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/iteration_storage.rs"]
+mod tests;

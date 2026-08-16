@@ -1,9 +1,9 @@
 #[path = "common/mod.rs"]
 mod common_tests;
 
-#[cfg(feature = "wide")]
-use kmeans_uni::CPUSimd;
 use kmeans_uni::{CPUScalar, CpuBackendType, KMeansBuilder, Primitive, SlicePointSource};
+#[cfg(feature = "wide")]
+use kmeans_uni::{CPUSimd128, CPUSimd256, CPUSimd512, CPUSimdAdaptive};
 
 use linfa::DatasetBase;
 use linfa::traits::{Fit, FitWith};
@@ -30,8 +30,26 @@ fn kmeans_f32_scalar_matches_linfa_on_clustered_data() {
 
 #[cfg(feature = "wide")]
 #[test]
+fn kmeans_f32_simd128_matches_linfa_on_clustered_data() {
+    clustered_parity::<f32, CPUSimd128>(4567);
+}
+
+#[cfg(feature = "wide")]
+#[test]
+fn kmeans_f32_adaptive_simd_matches_linfa_on_clustered_data() {
+    clustered_parity::<f32, CPUSimdAdaptive>(4567);
+}
+
+#[cfg(feature = "wide")]
+#[test]
 fn kmeans_f32_simd_matches_linfa_on_clustered_data() {
-    clustered_parity::<f32, CPUSimd>(4567);
+    clustered_parity::<f32, CPUSimd256>(4567);
+}
+
+#[cfg(feature = "wide")]
+#[test]
+fn kmeans_f32_simd512_matches_linfa_on_clustered_data() {
+    clustered_parity::<f32, CPUSimd512>(4567);
 }
 
 #[test]
@@ -41,8 +59,26 @@ fn kmeans_f64_scalar_matches_linfa_on_clustered_data() {
 
 #[cfg(feature = "wide")]
 #[test]
+fn kmeans_f64_simd128_matches_linfa_on_clustered_data() {
+    clustered_parity::<f64, CPUSimd128>(1357);
+}
+
+#[cfg(feature = "wide")]
+#[test]
+fn kmeans_f64_adaptive_simd_matches_linfa_on_clustered_data() {
+    clustered_parity::<f64, CPUSimdAdaptive>(1357);
+}
+
+#[cfg(feature = "wide")]
+#[test]
 fn kmeans_f64_simd_matches_linfa_on_clustered_data() {
-    clustered_parity::<f64, CPUSimd>(1357);
+    clustered_parity::<f64, CPUSimd256>(1357);
+}
+
+#[cfg(feature = "wide")]
+#[test]
+fn kmeans_f64_simd512_matches_linfa_on_clustered_data() {
+    clustered_parity::<f64, CPUSimd512>(1357);
 }
 
 #[test]

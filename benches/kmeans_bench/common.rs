@@ -1,9 +1,9 @@
 use divan::black_box;
-#[cfg(feature = "wide")]
-use kmeans_uni::CPUSimd;
 use kmeans_uni::{
     CPUScalar, CpuBackendType, KMeansBuilder, PointSource, Primitive, SlicePointSource,
 };
+#[cfg(feature = "wide")]
+use kmeans_uni::{CPUSimd256, CPUSimdAdaptive};
 use linfa::DatasetBase;
 use linfa::traits::{Fit, FitWith};
 use linfa_clustering::{IncrKMeansError, KMeans as LinfaKMeans};
@@ -170,6 +170,19 @@ where
     }
 }
 
+#[cfg(feature = "wide")]
+pub(crate) fn run_uni_full_shape_adaptive<F>(
+    data: &[F],
+    shape: Shape,
+    parallel: bool,
+) -> kmeans_uni::KMeans<F>
+where
+    F: Primitive,
+    CPUSimdAdaptive: CpuBackendType<F>,
+{
+    run_uni_full_shape::<F, CPUSimdAdaptive>(data, shape, parallel)
+}
+
 pub(crate) fn run_uni_init_from_source<F, B, S>(source: &S, parallel: bool) -> kmeans_uni::KMeans<F>
 where
     F: Primitive,
@@ -235,14 +248,14 @@ pub(crate) fn get_uni_model_scalar_f64() -> (&'static kmeans_uni::KMeans<f64>, &
 #[cfg(feature = "wide")]
 pub(crate) fn get_uni_model_simd_f32() -> (&'static kmeans_uni::KMeans<f32>, &'static [f32]) {
     let data = get_data_f32();
-    let model = UNI_MODEL_SIMD_F32.get_or_init(|| run_uni_full::<f32, CPUSimd>(data, false));
+    let model = UNI_MODEL_SIMD_F32.get_or_init(|| run_uni_full::<f32, CPUSimd256>(data, false));
     (model, data)
 }
 
 #[cfg(feature = "wide")]
 pub(crate) fn get_uni_model_simd_f64() -> (&'static kmeans_uni::KMeans<f64>, &'static [f64]) {
     let data = get_data_f64();
-    let model = UNI_MODEL_SIMD_F64.get_or_init(|| run_uni_full::<f64, CPUSimd>(data, false));
+    let model = UNI_MODEL_SIMD_F64.get_or_init(|| run_uni_full::<f64, CPUSimd256>(data, false));
     (model, data)
 }
 

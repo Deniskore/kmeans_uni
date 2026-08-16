@@ -1,3 +1,5 @@
+#[cfg(feature = "wide")]
+use crate::common::run_uni_full_shape_adaptive;
 use crate::common::{
     Shape, linfa_dataset_f32, linfa_dataset_f64, run_linfa_full_shape_f32,
     run_linfa_full_shape_f64, run_uni_full_shape, shape_data_f32, shape_data_f64,
@@ -5,7 +7,7 @@ use crate::common::{
 use divan::{Bencher, black_box};
 use kmeans_uni::CPUScalar;
 #[cfg(feature = "wide")]
-use kmeans_uni::CPUSimd;
+use kmeans_uni::{CPUSimd128, CPUSimd256, CPUSimd512, CPUSimdAdaptive};
 use linfa::prelude::Predict;
 
 // Shape matrix benchmarks are intentionally split into two stories:
@@ -30,7 +32,7 @@ macro_rules! shape_fit_set {
             let shape = $shape;
             let data = shape_data_f32(shape);
             bencher.bench_local(|| {
-                run_uni_full_shape::<f32, CPUSimd>(black_box(data.as_slice()), shape, false)
+                run_uni_full_shape::<f32, CPUSimd256>(black_box(data.as_slice()), shape, false)
             });
         }
 
@@ -61,7 +63,7 @@ macro_rules! shape_fit_set_f64 {
             let shape = $shape;
             let data = shape_data_f64(shape);
             bencher.bench_local(|| {
-                run_uni_full_shape::<f64, CPUSimd>(black_box(data.as_slice()), shape, false)
+                run_uni_full_shape::<f64, CPUSimd256>(black_box(data.as_slice()), shape, false)
             });
         }
 
@@ -94,10 +96,10 @@ macro_rules! shape_predict_set {
         fn $uni_simd(bencher: Bencher) {
             let shape = $shape;
             let data = shape_data_f32(shape);
-            let model = run_uni_full_shape::<f32, CPUSimd>(data.as_slice(), shape, false);
+            let model = run_uni_full_shape::<f32, CPUSimd256>(data.as_slice(), shape, false);
             bencher.bench_local(|| {
                 black_box(&model)
-                    .predict_with_backend::<CPUSimd>(black_box(data.as_slice()))
+                    .predict_with_backend::<CPUSimd256>(black_box(data.as_slice()))
                     .unwrap()
             });
         }
@@ -132,10 +134,10 @@ macro_rules! shape_predict_set_f64 {
         fn $uni_simd(bencher: Bencher) {
             let shape = $shape;
             let data = shape_data_f64(shape);
-            let model = run_uni_full_shape::<f64, CPUSimd>(data.as_slice(), shape, false);
+            let model = run_uni_full_shape::<f64, CPUSimd256>(data.as_slice(), shape, false);
             bencher.bench_local(|| {
                 black_box(&model)
-                    .predict_with_backend::<CPUSimd>(black_box(data.as_slice()))
+                    .predict_with_backend::<CPUSimd256>(black_box(data.as_slice()))
                     .unwrap()
             });
         }
@@ -151,10 +153,96 @@ macro_rules! shape_predict_set_f64 {
     };
 }
 
+macro_rules! shape_fit_widths {
+    ($simd128:ident, $adaptive:ident, $simd512:ident, $float:ty, $data_fn:ident, $shape:expr) => {
+        #[cfg(feature = "wide")]
+        #[divan::bench]
+        fn $simd128(bencher: Bencher) {
+            let shape = $shape;
+            let data = $data_fn(shape);
+            bencher.bench_local(|| {
+                run_uni_full_shape::<$float, CPUSimd128>(black_box(data.as_slice()), shape, false)
+            });
+        }
+
+        #[cfg(feature = "wide")]
+        #[divan::bench]
+        fn $adaptive(bencher: Bencher) {
+            let shape = $shape;
+            let data = $data_fn(shape);
+            bencher.bench_local(|| {
+                run_uni_full_shape_adaptive::<$float>(black_box(data.as_slice()), shape, false)
+            });
+        }
+
+        #[cfg(feature = "wide")]
+        #[divan::bench]
+        fn $simd512(bencher: Bencher) {
+            let shape = $shape;
+            let data = $data_fn(shape);
+            bencher.bench_local(|| {
+                run_uni_full_shape::<$float, CPUSimd512>(black_box(data.as_slice()), shape, false)
+            });
+        }
+    };
+}
+
+macro_rules! shape_predict_widths {
+    ($simd128:ident, $adaptive:ident, $simd512:ident, $float:ty, $data_fn:ident, $shape:expr) => {
+        #[cfg(feature = "wide")]
+        #[divan::bench]
+        fn $simd128(bencher: Bencher) {
+            let shape = $shape;
+            let data = $data_fn(shape);
+            let model = run_uni_full_shape::<$float, CPUSimd128>(data.as_slice(), shape, false);
+            bencher.bench_local(|| {
+                black_box(&model)
+                    .predict_with_backend::<CPUSimd128>(black_box(data.as_slice()))
+                    .unwrap()
+            });
+        }
+
+        #[cfg(feature = "wide")]
+        #[divan::bench]
+        fn $adaptive(bencher: Bencher) {
+            let shape = $shape;
+            let data = $data_fn(shape);
+            let model =
+                run_uni_full_shape::<$float, CPUSimdAdaptive>(data.as_slice(), shape, false);
+            bencher.bench_local(|| {
+                black_box(&model)
+                    .predict_with_backend::<CPUSimdAdaptive>(black_box(data.as_slice()))
+                    .unwrap()
+            });
+        }
+
+        #[cfg(feature = "wide")]
+        #[divan::bench]
+        fn $simd512(bencher: Bencher) {
+            let shape = $shape;
+            let data = $data_fn(shape);
+            let model = run_uni_full_shape::<$float, CPUSimd512>(data.as_slice(), shape, false);
+            bencher.bench_local(|| {
+                black_box(&model)
+                    .predict_with_backend::<CPUSimd512>(black_box(data.as_slice()))
+                    .unwrap()
+            });
+        }
+    };
+}
+
 shape_fit_set!(
     shape_fit_f32_cols8_k8_uni_scalar_seq,
     shape_fit_f32_cols8_k8_uni_simd_seq,
     shape_fit_f32_cols8_k8_linfa_seq,
+    Shape::new(8192, 8, 8)
+);
+shape_fit_widths!(
+    shape_fit_f32_cols8_k8_uni_simd128_seq,
+    shape_fit_f32_cols8_k8_uni_simd_adaptive_seq,
+    shape_fit_f32_cols8_k8_uni_simd512_seq,
+    f32,
+    shape_data_f32,
     Shape::new(8192, 8, 8)
 );
 
@@ -164,11 +252,27 @@ shape_fit_set!(
     shape_fit_f32_cols15_k16_linfa_seq,
     Shape::new(8192, 15, 16)
 );
+shape_fit_widths!(
+    shape_fit_f32_cols15_k16_uni_simd128_seq,
+    shape_fit_f32_cols15_k16_uni_simd_adaptive_seq,
+    shape_fit_f32_cols15_k16_uni_simd512_seq,
+    f32,
+    shape_data_f32,
+    Shape::new(8192, 15, 16)
+);
 
 shape_fit_set!(
     shape_fit_f32_cols16_k17_uni_scalar_seq,
     shape_fit_f32_cols16_k17_uni_simd_seq,
     shape_fit_f32_cols16_k17_linfa_seq,
+    Shape::new(8192, 16, 17)
+);
+shape_fit_widths!(
+    shape_fit_f32_cols16_k17_uni_simd128_seq,
+    shape_fit_f32_cols16_k17_uni_simd_adaptive_seq,
+    shape_fit_f32_cols16_k17_uni_simd512_seq,
+    f32,
+    shape_data_f32,
     Shape::new(8192, 16, 17)
 );
 
@@ -178,11 +282,27 @@ shape_fit_set!(
     shape_fit_f32_cols64_k32_linfa_seq,
     Shape::new(4096, 64, 32)
 );
+shape_fit_widths!(
+    shape_fit_f32_cols64_k32_uni_simd128_seq,
+    shape_fit_f32_cols64_k32_uni_simd_adaptive_seq,
+    shape_fit_f32_cols64_k32_uni_simd512_seq,
+    f32,
+    shape_data_f32,
+    Shape::new(4096, 64, 32)
+);
 
 shape_fit_set_f64!(
     shape_fit_f64_cols16_k16_uni_scalar_seq,
     shape_fit_f64_cols16_k16_uni_simd_seq,
     shape_fit_f64_cols16_k16_linfa_seq,
+    Shape::new(4096, 16, 16)
+);
+shape_fit_widths!(
+    shape_fit_f64_cols16_k16_uni_simd128_seq,
+    shape_fit_f64_cols16_k16_uni_simd_adaptive_seq,
+    shape_fit_f64_cols16_k16_uni_simd512_seq,
+    f64,
+    shape_data_f64,
     Shape::new(4096, 16, 16)
 );
 
@@ -192,11 +312,27 @@ shape_fit_set_f64!(
     shape_fit_f64_cols17_k17_linfa_seq,
     Shape::new(4096, 17, 17)
 );
+shape_fit_widths!(
+    shape_fit_f64_cols17_k17_uni_simd128_seq,
+    shape_fit_f64_cols17_k17_uni_simd_adaptive_seq,
+    shape_fit_f64_cols17_k17_uni_simd512_seq,
+    f64,
+    shape_data_f64,
+    Shape::new(4096, 17, 17)
+);
 
 shape_predict_set!(
     shape_predict_f32_cols8_k8_uni_scalar,
     shape_predict_f32_cols8_k8_uni_simd,
     shape_predict_f32_cols8_k8_linfa,
+    Shape::new(8192, 8, 8)
+);
+shape_predict_widths!(
+    shape_predict_f32_cols8_k8_uni_simd128,
+    shape_predict_f32_cols8_k8_uni_simd_adaptive,
+    shape_predict_f32_cols8_k8_uni_simd512,
+    f32,
+    shape_data_f32,
     Shape::new(8192, 8, 8)
 );
 
@@ -206,11 +342,27 @@ shape_predict_set!(
     shape_predict_f32_cols15_k16_linfa,
     Shape::new(8192, 15, 16)
 );
+shape_predict_widths!(
+    shape_predict_f32_cols15_k16_uni_simd128,
+    shape_predict_f32_cols15_k16_uni_simd_adaptive,
+    shape_predict_f32_cols15_k16_uni_simd512,
+    f32,
+    shape_data_f32,
+    Shape::new(8192, 15, 16)
+);
 
 shape_predict_set!(
     shape_predict_f32_cols16_k17_uni_scalar,
     shape_predict_f32_cols16_k17_uni_simd,
     shape_predict_f32_cols16_k17_linfa,
+    Shape::new(8192, 16, 17)
+);
+shape_predict_widths!(
+    shape_predict_f32_cols16_k17_uni_simd128,
+    shape_predict_f32_cols16_k17_uni_simd_adaptive,
+    shape_predict_f32_cols16_k17_uni_simd512,
+    f32,
+    shape_data_f32,
     Shape::new(8192, 16, 17)
 );
 
@@ -220,6 +372,14 @@ shape_predict_set!(
     shape_predict_f32_cols64_k32_linfa,
     Shape::new(4096, 64, 32)
 );
+shape_predict_widths!(
+    shape_predict_f32_cols64_k32_uni_simd128,
+    shape_predict_f32_cols64_k32_uni_simd_adaptive,
+    shape_predict_f32_cols64_k32_uni_simd512,
+    f32,
+    shape_data_f32,
+    Shape::new(4096, 64, 32)
+);
 
 shape_predict_set_f64!(
     shape_predict_f64_cols16_k16_uni_scalar,
@@ -227,10 +387,26 @@ shape_predict_set_f64!(
     shape_predict_f64_cols16_k16_linfa,
     Shape::new(4096, 16, 16)
 );
+shape_predict_widths!(
+    shape_predict_f64_cols16_k16_uni_simd128,
+    shape_predict_f64_cols16_k16_uni_simd_adaptive,
+    shape_predict_f64_cols16_k16_uni_simd512,
+    f64,
+    shape_data_f64,
+    Shape::new(4096, 16, 16)
+);
 
 shape_predict_set_f64!(
     shape_predict_f64_cols17_k17_uni_scalar,
     shape_predict_f64_cols17_k17_uni_simd,
     shape_predict_f64_cols17_k17_linfa,
+    Shape::new(4096, 17, 17)
+);
+shape_predict_widths!(
+    shape_predict_f64_cols17_k17_uni_simd128,
+    shape_predict_f64_cols17_k17_uni_simd_adaptive,
+    shape_predict_f64_cols17_k17_uni_simd512,
+    f64,
+    shape_data_f64,
     Shape::new(4096, 17, 17)
 );

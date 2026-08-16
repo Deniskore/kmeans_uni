@@ -11,7 +11,7 @@ Fast, safe K-Means++ for CPU-only workloads with optional SIMD acceleration. Sup
 
 - Runs on stable Rust with 100% safe code (`#![forbid(unsafe_code)]`) and a small dependency set.
 - Optimized for speed: beats `linfa-clustering` 0.8.1 in AArch64/x86_64 benches for training and prediction; in a separate local benchmark, it also measured up to 79% lower median runtime than `kmeans` 2.0.2 across different shapes.
-- Optional SIMD acceleration (`wide` feature) and WebAssembly support (see [`WASM.md`](./WASM.md)).
+- Optional 128-bit, 256-bit, and 512-bit logical SIMD backends (`wide` feature) and WebAssembly support (see [`WASM.md`](./WASM.md)).
 - Ergonomic builder API.
 
 ## Quickstart
@@ -72,6 +72,16 @@ match KMeansBuilder::new(8)
 - `serde`: derive `Serialize`/`Deserialize` on public types.
 - `wasm`: build with a wasm-friendly configuration (sequential execution, no Rayon). See [`WASM.md`](./WASM.md) for a browser demo and build steps.
 - Build without defaults (`--no-default-features`) to force scalar-only code paths.
+
+## SIMD backends
+
+`.cpu_simd()` uses `CPUSimdAdaptive`, which selects a logical width from the target and centroid shape. Fixed-width alternatives are `.cpu_simd128()`, `.cpu_simd256()`, and `.cpu_simd512()`.
+
+Widths are logical: unsupported widths may use multiple narrower vectors, so wider is not always faster. Selection uses compile-time CPU features, not runtime detection. For native builds:
+
+```bash
+RUSTFLAGS="-C target-cpu=native" cargo build --release
+```
 
 ## License
 
