@@ -10,7 +10,7 @@ mod kmeans_mini_batch;
 mod point_source;
 mod primitive;
 
-use backend::CoreBackend;
+use backend::{CoreBackend, PreparedCentroidLayout};
 use error::Error as KMeansError;
 pub use error::{Error, Result};
 use kmeans_core_common::calculate_chunk_size;
@@ -18,25 +18,119 @@ use kmeans_cpu::run as run_cpu;
 use point_source::view_or_copy_batch;
 pub use point_source::{PointSource, SlicePointSource};
 pub use primitive::Primitive;
-use std::any::TypeId;
-use std::borrow::Cow;
 use std::marker::PhantomData;
+#[cfg(feature = "wide")]
 use std::sync::OnceLock;
 
-#[cfg(feature = "wide")]
-mod kmeans_core_simd;
-#[cfg(feature = "wide")]
-pub struct CPUSimd;
-#[cfg(feature = "wide")]
-impl BackendType for CPUSimd {}
-#[cfg(feature = "wide")]
-impl CpuBackendType<f32> for CPUSimd {
-    type Core = kmeans_core_simd::SimdBackend;
+#[cfg(not(feature = "wasm"))]
+const MIN_POINTS_PER_PARALLEL_TASK: usize = 128;
+#[cfg(not(feature = "wasm"))]
+const MIN_TRANSFORM_POINTS_PER_PARALLEL_TASK: usize = 256;
+
+#[cfg(not(feature = "wasm"))]
+#[inline]
+fn balanced_parallel_chunk_size(
+    npoints: usize,
+    sequential_chunk_size: usize,
+    min_points_per_task: usize,
+) -> Option<usize> {
+    let thread_count = rayon::current_num_threads().max(1);
+    if thread_count == 1 || npoints < thread_count.saturating_mul(min_points_per_task) {
+        return None;
+    }
+
+    Some(sequential_chunk_size.min(npoints.div_ceil(thread_count)))
 }
 
 #[cfg(feature = "wide")]
-impl CpuBackendType<f64> for CPUSimd {
-    type Core = kmeans_core_simd::SimdBackend;
+mod kmeans_core_simd;
+
+/// The shape-adaptive SIMD CPU backend.
+///
+/// On AArch64 and WebAssembly this backend maps directly to the logical 128-bit kernel. On other
+/// targets it selects one of the logical 128-bit, 256-bit, or 512-bit kernels once per centroid
+/// shape using a conservative padding-aware policy. Use a width-specific backend to bypass this
+/// policy. Selection observes compile-time target features; it does not perform runtime CPU
+/// feature detection.
+#[cfg(feature = "wide")]
+pub struct CPUSimdAdaptive;
+#[cfg(feature = "wide")]
+impl BackendType for CPUSimdAdaptive {}
+#[cfg(all(feature = "wide", any(target_arch = "aarch64", target_arch = "wasm32")))]
+impl CpuBackendType<f32> for CPUSimdAdaptive {
+    type Core = kmeans_core_simd::SimdBackend128;
+}
+#[cfg(all(
+    feature = "wide",
+    not(any(target_arch = "aarch64", target_arch = "wasm32"))
+))]
+impl CpuBackendType<f32> for CPUSimdAdaptive {
+    type Core = kmeans_core_simd::SimdBackendAdaptive;
+}
+#[cfg(all(feature = "wide", any(target_arch = "aarch64", target_arch = "wasm32")))]
+impl CpuBackendType<f64> for CPUSimdAdaptive {
+    type Core = kmeans_core_simd::SimdBackend128;
+}
+#[cfg(all(
+    feature = "wide",
+    not(any(target_arch = "aarch64", target_arch = "wasm32"))
+))]
+impl CpuBackendType<f64> for CPUSimdAdaptive {
+    type Core = kmeans_core_simd::SimdBackendAdaptive;
+}
+
+/// A logical 128-bit SIMD CPU backend.
+///
+/// This is the native width selected by [`CPUSimdAdaptive`] on AArch64 and WebAssembly, where
+/// `wide` uses NEON and `simd128` vectors respectively.
+#[cfg(feature = "wide")]
+pub struct CPUSimd128;
+#[cfg(feature = "wide")]
+impl BackendType for CPUSimd128 {}
+#[cfg(feature = "wide")]
+impl CpuBackendType<f32> for CPUSimd128 {
+    type Core = kmeans_core_simd::SimdBackend128;
+}
+#[cfg(feature = "wide")]
+impl CpuBackendType<f64> for CPUSimd128 {
+    type Core = kmeans_core_simd::SimdBackend128;
+}
+
+/// A logical 256-bit SIMD CPU backend.
+///
+/// This is the conservative default for several [`CPUSimdAdaptive`] shapes on targets other than
+/// AArch64 and WebAssembly. On targets without native 256-bit vectors, `wide` implements each
+/// logical vector using narrower vectors.
+#[cfg(feature = "wide")]
+pub struct CPUSimd256;
+#[cfg(feature = "wide")]
+impl BackendType for CPUSimd256 {}
+#[cfg(feature = "wide")]
+impl CpuBackendType<f32> for CPUSimd256 {
+    type Core = kmeans_core_simd::SimdBackend256;
+}
+#[cfg(feature = "wide")]
+impl CpuBackendType<f64> for CPUSimd256 {
+    type Core = kmeans_core_simd::SimdBackend256;
+}
+
+/// A logical 512-bit SIMD CPU backend.
+///
+/// On x86/x86-64, compile with `-C target-cpu=native` (or an appropriate AVX-512 target feature
+/// set) to emit native AVX-512 instructions. On other targets, or without AVX-512 enabled,
+/// `wide` implements each logical vector using narrower vectors. That remains portable but may be
+/// slower than [`CPUSimd128`] or [`CPUSimd256`].
+#[cfg(feature = "wide")]
+pub struct CPUSimd512;
+#[cfg(feature = "wide")]
+impl BackendType for CPUSimd512 {}
+#[cfg(feature = "wide")]
+impl CpuBackendType<f32> for CPUSimd512 {
+    type Core = kmeans_core_simd::SimdBackend512;
+}
+#[cfg(feature = "wide")]
+impl CpuBackendType<f64> for CPUSimd512 {
+    type Core = kmeans_core_simd::SimdBackend512;
 }
 
 pub struct CPUScalar;
@@ -92,15 +186,27 @@ pub use kmeans_core::{InitializationStrategy, KMeansPlusPlus};
 
 #[derive(Debug)]
 struct PreparedCentroidCache<F> {
-    scalar: OnceLock<Vec<F>>,
-    default: OnceLock<Vec<F>>,
+    #[cfg(feature = "wide")]
+    simd128: OnceLock<Box<[F]>>,
+    #[cfg(feature = "wide")]
+    simd256: OnceLock<Box<[F]>>,
+    #[cfg(feature = "wide")]
+    simd512: OnceLock<Box<[F]>>,
+    #[cfg(not(feature = "wide"))]
+    marker: PhantomData<F>,
 }
 
 impl<F> Default for PreparedCentroidCache<F> {
     fn default() -> Self {
         Self {
-            scalar: OnceLock::new(),
-            default: OnceLock::new(),
+            #[cfg(feature = "wide")]
+            simd128: OnceLock::new(),
+            #[cfg(feature = "wide")]
+            simd256: OnceLock::new(),
+            #[cfg(feature = "wide")]
+            simd512: OnceLock::new(),
+            #[cfg(not(feature = "wide"))]
+            marker: PhantomData,
         }
     }
 }
@@ -109,35 +215,28 @@ impl<F: Primitive> PreparedCentroidCache<F> {
     #[inline]
     fn get_for_backend<'a, B: CpuBackendType<F>>(
         &'a self,
-        centroids: &[F],
+        centroids: &'a [F],
         ncols: usize,
         k: usize,
-    ) -> Cow<'a, [F]> {
-        let core_id = TypeId::of::<B::Core>();
+    ) -> &'a [F] {
+        #[cfg(not(feature = "wide"))]
+        let _ = ncols;
 
-        if core_id == TypeId::of::<kmeans_core_scalar::ScalarBackend>() {
-            return Cow::Borrowed(
-                self.scalar
-                    .get_or_init(|| {
-                        kmeans_core_scalar::ScalarBackend::prepare_centroids(centroids, ncols, k)
-                    })
-                    .as_slice(),
-            );
+        match B::Core::prepared_centroid_layout(k) {
+            PreparedCentroidLayout::Identity => centroids,
+            #[cfg(feature = "wide")]
+            PreparedCentroidLayout::Simd128 => self
+                .simd128
+                .get_or_init(|| B::Core::prepare_centroids(centroids, ncols, k).into_boxed_slice()),
+            #[cfg(feature = "wide")]
+            PreparedCentroidLayout::Simd256 => self
+                .simd256
+                .get_or_init(|| B::Core::prepare_centroids(centroids, ncols, k).into_boxed_slice()),
+            #[cfg(feature = "wide")]
+            PreparedCentroidLayout::Simd512 => self
+                .simd512
+                .get_or_init(|| B::Core::prepare_centroids(centroids, ncols, k).into_boxed_slice()),
         }
-
-        if core_id == TypeId::of::<<F::DefaultInferenceBackend as CpuBackendType<F>>::Core>() {
-            return Cow::Borrowed(
-                self.default
-                    .get_or_init(|| {
-                        <F::DefaultInferenceBackend as CpuBackendType<F>>::Core::prepare_centroids(
-                            centroids, ncols, k,
-                        )
-                    })
-                    .as_slice(),
-            );
-        }
-
-        Cow::Owned(B::Core::prepare_centroids(centroids, ncols, k))
     }
 }
 
@@ -272,7 +371,7 @@ impl<F: Primitive> KMeans<F> {
     }
 
     #[inline]
-    fn prepared_centroids_for_backend<B: CpuBackendType<F>>(&self) -> Cow<'_, [F]> {
+    fn prepared_centroids_for_backend<B: CpuBackendType<F>>(&self) -> &[F] {
         self.prepared_centroid_cache
             .get_for_backend::<B>(&self.centroids, self.ncols, self.k)
     }
@@ -338,19 +437,28 @@ impl<F: Primitive> KMeans<F> {
         let points_per_chunk = B::Core::transform_points_per_chunk(self.ncols, self.k);
 
         #[cfg(not(feature = "wasm"))]
-        if PARALLEL {
+        if let Some(parallel_chunk_size) = PARALLEL
+            .then(|| {
+                balanced_parallel_chunk_size(
+                    npoints,
+                    points_per_chunk,
+                    MIN_TRANSFORM_POINTS_PER_PARALLEL_TASK,
+                )
+            })
+            .flatten()
+        {
             use rayon::prelude::*;
             scores
-                .par_chunks_mut(points_per_chunk * self.k)
+                .par_chunks_mut(parallel_chunk_size * self.k)
                 .enumerate()
                 .for_each(|(chunk_idx, chunk_scores)| {
-                    let start_point_idx = chunk_idx * points_per_chunk;
+                    let start_point_idx = chunk_idx * parallel_chunk_size;
                     let point_count = chunk_scores.len() / self.k;
                     let chunk_points = &points[start_point_idx * self.ncols
                         ..(start_point_idx + point_count) * self.ncols];
                     self.transform_chunk_with_backend::<B>(
                         chunk_points,
-                        prepared_centroids.as_ref(),
+                        prepared_centroids,
                         chunk_scores,
                     );
                 });
@@ -363,11 +471,7 @@ impl<F: Primitive> KMeans<F> {
             let chunk_points =
                 &points[start_point_idx * self.ncols..(start_point_idx + point_count) * self.ncols];
 
-            self.transform_chunk_with_backend::<B>(
-                chunk_points,
-                prepared_centroids.as_ref(),
-                chunk_scores,
-            );
+            self.transform_chunk_with_backend::<B>(chunk_points, prepared_centroids, chunk_scores);
         }
 
         Ok(scores)
@@ -458,18 +562,23 @@ impl<F: Primitive> KMeans<F> {
         let _ = parallel;
 
         #[cfg(not(feature = "wasm"))]
-        if parallel {
+        if let Some(parallel_chunk_size) = parallel
+            .then(|| {
+                balanced_parallel_chunk_size(npoints, chunk_size, MIN_POINTS_PER_PARALLEL_TASK)
+            })
+            .flatten()
+        {
             use rayon::prelude::*;
             labels
-                .par_chunks_mut(chunk_size)
+                .par_chunks_mut(parallel_chunk_size)
                 .enumerate()
                 .for_each(|(chunk_idx, chunk_labels)| {
-                    let start = chunk_idx * chunk_size;
+                    let start = chunk_idx * parallel_chunk_size;
                     let end = start + chunk_labels.len();
                     let chunk_points = &points[start * self.ncols..end * self.ncols];
                     self.assign_labels_chunk_with_backend::<B>(
                         chunk_points,
-                        prepared_centroids.as_ref(),
+                        prepared_centroids,
                         chunk_labels,
                     );
                 });
@@ -485,7 +594,7 @@ impl<F: Primitive> KMeans<F> {
                 let chunk_points = &points[start * self.ncols..end * self.ncols];
                 self.assign_labels_chunk_with_backend::<B>(
                     chunk_points,
-                    prepared_centroids.as_ref(),
+                    prepared_centroids,
                     chunk_labels,
                 );
             }
@@ -527,27 +636,32 @@ impl<F: Primitive> KMeans<F> {
         let _ = parallel;
 
         #[cfg(not(feature = "wasm"))]
-        if parallel {
+        if let Some(parallel_chunk_size) = parallel
+            .then(|| {
+                balanced_parallel_chunk_size(npoints, chunk_size, MIN_POINTS_PER_PARALLEL_TASK)
+            })
+            .flatten()
+        {
             use rayon::prelude::*;
             labels
-                .par_chunks_mut(chunk_size)
+                .par_chunks_mut(parallel_chunk_size)
                 .enumerate()
                 .try_for_each_init(
                     || None::<Vec<F>>,
                     |fallback_buffer, (chunk_idx, label_slice)| -> Result<()> {
-                        let start = chunk_idx * chunk_size;
+                        let start = chunk_idx * parallel_chunk_size;
                         let count = label_slice.len();
                         let point_slice = view_or_copy_batch(
                             source,
                             fallback_buffer,
                             start,
                             count,
-                            chunk_size,
+                            parallel_chunk_size,
                             self.ncols,
                         )?;
                         self.assign_labels_chunk_with_backend::<B>(
                             point_slice,
-                            prepared_centroids.as_ref(),
+                            prepared_centroids,
                             label_slice,
                         );
                         Ok(())
@@ -571,7 +685,7 @@ impl<F: Primitive> KMeans<F> {
             )?;
             self.assign_labels_chunk_with_backend::<B>(
                 point_slice,
-                prepared_centroids.as_ref(),
+                prepared_centroids,
                 label_slice,
             );
 
@@ -636,6 +750,33 @@ impl KMeans<f32> {
             .build()
             .fit(points, ncols)
     }
+
+    /// Fit with the logical 128-bit SIMD CPU backend and Euclidean metric.
+    pub fn fit_default_simd128(points: impl AsRef<[f32]>, ncols: usize, k: usize) -> Result<Self> {
+        KMeansBuilder::new(k)
+            .cpu_simd128()
+            .euclidean()
+            .build()
+            .fit(points, ncols)
+    }
+
+    /// Fit with the logical 256-bit SIMD CPU backend and Euclidean metric.
+    pub fn fit_default_simd256(points: impl AsRef<[f32]>, ncols: usize, k: usize) -> Result<Self> {
+        KMeansBuilder::new(k)
+            .cpu_simd256()
+            .euclidean()
+            .build()
+            .fit(points, ncols)
+    }
+
+    /// Fit with the logical 512-bit SIMD CPU backend and Euclidean metric.
+    pub fn fit_default_simd512(points: impl AsRef<[f32]>, ncols: usize, k: usize) -> Result<Self> {
+        KMeansBuilder::new(k)
+            .cpu_simd512()
+            .euclidean()
+            .build()
+            .fit(points, ncols)
+    }
 }
 
 #[cfg(feature = "wide")]
@@ -644,6 +785,33 @@ impl KMeans<f64> {
     pub fn fit_default_simd(points: impl AsRef<[f64]>, ncols: usize, k: usize) -> Result<Self> {
         KMeansBuilder::new(k)
             .cpu_simd()
+            .euclidean()
+            .build()
+            .fit(points, ncols)
+    }
+
+    /// Fit with the logical 128-bit SIMD CPU backend and Euclidean metric.
+    pub fn fit_default_simd128(points: impl AsRef<[f64]>, ncols: usize, k: usize) -> Result<Self> {
+        KMeansBuilder::new(k)
+            .cpu_simd128()
+            .euclidean()
+            .build()
+            .fit(points, ncols)
+    }
+
+    /// Fit with the logical 256-bit SIMD CPU backend and Euclidean metric.
+    pub fn fit_default_simd256(points: impl AsRef<[f64]>, ncols: usize, k: usize) -> Result<Self> {
+        KMeansBuilder::new(k)
+            .cpu_simd256()
+            .euclidean()
+            .build()
+            .fit(points, ncols)
+    }
+
+    /// Fit with the logical 512-bit SIMD CPU backend and Euclidean metric.
+    pub fn fit_default_simd512(points: impl AsRef<[f64]>, ncols: usize, k: usize) -> Result<Self> {
+        KMeansBuilder::new(k)
+            .cpu_simd512()
             .euclidean()
             .build()
             .fit(points, ncols)
@@ -824,10 +992,38 @@ impl<F: Primitive, B, A, I: InitializationStrategy> KMeansBuilder<F, B, A, I> {
         self.backend::<CPUScalar>()
     }
 
+    /// Select the shape-adaptive SIMD backend.
+    ///
+    /// Use the width-specific methods when a fixed logical width is required.
     #[cfg(feature = "wide")]
     #[inline]
-    pub fn cpu_simd(self) -> KMeansBuilder<F, CPUSimd, A, I> {
-        self.backend::<CPUSimd>()
+    pub fn cpu_simd(self) -> KMeansBuilder<F, CPUSimdAdaptive, A, I> {
+        self.backend::<CPUSimdAdaptive>()
+    }
+
+    /// Select the logical 128-bit SIMD backend explicitly.
+    #[cfg(feature = "wide")]
+    #[inline]
+    pub fn cpu_simd128(self) -> KMeansBuilder<F, CPUSimd128, A, I> {
+        self.backend::<CPUSimd128>()
+    }
+
+    /// Select the logical 256-bit SIMD backend explicitly.
+    #[cfg(feature = "wide")]
+    #[inline]
+    pub fn cpu_simd256(self) -> KMeansBuilder<F, CPUSimd256, A, I> {
+        self.backend::<CPUSimd256>()
+    }
+
+    /// Select the logical 512-bit SIMD backend explicitly.
+    ///
+    /// On x86/x86-64, native AVX-512 instructions are emitted only when enabled through compiler
+    /// target options, such as `RUSTFLAGS="-C target-cpu=native"` on an AVX-512-capable machine.
+    /// Other targets implement this logical width using narrower vectors.
+    #[cfg(feature = "wide")]
+    #[inline]
+    pub fn cpu_simd512(self) -> KMeansBuilder<F, CPUSimd512, A, I> {
+        self.backend::<CPUSimd512>()
     }
 
     #[inline]
@@ -1218,3 +1414,11 @@ fn validate_prediction_source_inputs<F: Primitive, S: PointSource<F>>(
     }
     Ok(())
 }
+
+#[cfg(all(test, feature = "wide"))]
+#[path = "../tests/unit/centroid_cache.rs"]
+mod centroid_cache_tests;
+
+#[cfg(all(test, not(feature = "wasm")))]
+#[path = "../tests/unit/parallel_chunk_balancing.rs"]
+mod parallel_chunk_balancing_tests;

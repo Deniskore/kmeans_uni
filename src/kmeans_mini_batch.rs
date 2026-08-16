@@ -2,7 +2,7 @@ use crate::backend::{CoreBackend, DistanceMetric};
 use crate::error::{Error as KMeansError, Result};
 use crate::{
     Primitive,
-    kmeans_core::{ExecutionStrategy, InitializationStrategy},
+    kmeans_core::{ExecutionStrategy, InitializationStrategy, IterationScratch},
     kmeans_core_common::calculate_chunk_size,
     point_source::PointSource,
 };
@@ -73,28 +73,36 @@ pub(crate) fn run<
     let mut total_sums = vec![F::zero(); k * ncols];
     let mut prev_batch_inertia = f64::INFINITY;
     let mut no_improvement_streak = 0;
+    let mut iteration_scratch = IterationScratch::new(k, ncols);
 
     for iter in 0..iterations.max(1) {
         let mut indices = sample(&mut rng, npoints, batch).into_vec();
         indices.sort_unstable();
 
-        let (batch_sums, batch_counts, batch_inertia) = E::compute_stats_indexed::<F, C, M, S>(
+        let batch_inertia = E::compute_stats_indexed::<F, C, M, S>(
             source,
             ncols,
             k,
             &prepared_centroids,
             &indices,
             par_chunk,
+            &mut iteration_scratch,
         )?;
 
         // Merge batch statistics into running totals
-        for c in 0..k {
-            let count = batch_counts[c];
+        for (c, (&count, batch_sums)) in iteration_scratch
+            .counts()
+            .iter()
+            .zip(iteration_scratch.sums().chunks_exact(ncols))
+            .enumerate()
+        {
             if count > 0 {
                 let base = c * ncols;
                 total_counts[c] += count;
-                for j in 0..ncols {
-                    total_sums[base + j] = total_sums[base + j] + batch_sums[base + j];
+                for (total_sum, &batch_sum) in
+                    total_sums[base..base + ncols].iter_mut().zip(batch_sums)
+                {
+                    *total_sum = *total_sum + batch_sum;
                 }
             }
         }
@@ -132,12 +140,19 @@ pub(crate) fn run<
             ncols,
             source,
             &mut rng,
+            iteration_scratch.empty_cluster_buffer(),
         );
     }
 
     // Recompute inertia across the full dataset with the final centroids for an accurate score
-    let (_, _, full_inertia) =
-        E::compute_stats_full::<F, C, M, S>(source, ncols, k, &prepared_centroids, par_chunk)?;
+    let full_inertia = E::compute_stats_full::<F, C, M, S>(
+        source,
+        ncols,
+        k,
+        &prepared_centroids,
+        par_chunk,
+        &mut iteration_scratch,
+    )?;
     let centroids = C::finalize_centroids(&prepared_centroids, ncols, k);
     let inertia = F::from(full_inertia).ok_or(KMeansError::ConversionFailure)?;
 

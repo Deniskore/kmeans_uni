@@ -1,7 +1,7 @@
 use rand::{Rng, RngExt};
 
 use crate::Primitive;
-use crate::backend::CoreBackend;
+use crate::backend::{CoreBackend, PreparedCentroidLayout};
 use crate::kmeans_core_common::{
     calculate_and_update_min_distance_generic, calculate_and_update_min_distance_generic_sum,
     calculate_transform_chunk_size, find_nearest_centroids_generic,
@@ -11,6 +11,11 @@ use crate::point_source::PointSource;
 pub struct ScalarBackend;
 
 impl<F: Primitive> CoreBackend<F> for ScalarBackend {
+    #[inline(always)]
+    fn prepared_centroid_layout(_k: usize) -> PreparedCentroidLayout {
+        PreparedCentroidLayout::Identity
+    }
+
     fn accumulate_point_slice(point: &[F], ncols: usize, sums: &mut [F], label: usize) {
         let cluster_sums = &mut sums[label * ncols..(label + 1) * ncols];
         for (sum, val) in cluster_sums.iter_mut().zip(point) {
@@ -38,6 +43,7 @@ impl<F: Primitive> CoreBackend<F> for ScalarBackend {
         ncols: usize,
         source: &S,
         rng: &mut R,
+        _empty_cluster_buffer: &mut Vec<F>,
     ) {
         for c in 0..counts.len() {
             let base = c * ncols;
@@ -63,10 +69,13 @@ impl<F: Primitive> CoreBackend<F> for ScalarBackend {
         ncols: usize,
         source: &S,
         rng: &mut R,
+        empty_cluster_buffer: &mut Vec<F>,
     ) -> F {
         let mut max_shift = F::zero();
         let npoints = source.num_points();
-        let mut sample = vec![F::zero(); ncols];
+        if npoints > 0 && counts.contains(&0) && empty_cluster_buffer.len() < ncols {
+            empty_cluster_buffer.resize(ncols, F::zero());
+        }
 
         for (c, &count) in counts.iter().enumerate() {
             let base = c * ncols;
@@ -84,7 +93,8 @@ impl<F: Primitive> CoreBackend<F> for ScalarBackend {
                 }
             } else if npoints > 0 {
                 let rand_idx = rng.random_range(0..npoints);
-                source.read_batch(rand_idx, 1, &mut sample);
+                let sample = &mut empty_cluster_buffer[..ncols];
+                source.read_batch(rand_idx, 1, sample);
                 for (j, &new_value) in sample.iter().enumerate() {
                     let idx = base + j;
                     let diff = (centroids[idx] - new_value).abs();

@@ -25,7 +25,7 @@ pub trait Primitive: sealed::Sealed + Float + Debug + Send + Sync + 'static {
 
 #[cfg(feature = "wide")]
 impl Primitive for f32 {
-    type DefaultInferenceBackend = crate::CPUSimd;
+    type DefaultInferenceBackend = crate::CPUSimdAdaptive;
 
     #[inline(always)]
     fn from_usize(n: usize) -> Self {
@@ -45,7 +45,7 @@ impl Primitive for f32 {
 
 #[cfg(feature = "wide")]
 impl Primitive for f64 {
-    type DefaultInferenceBackend = crate::CPUSimd;
+    type DefaultInferenceBackend = crate::CPUSimdAdaptive;
 
     #[inline(always)]
     fn from_usize(n: usize) -> Self {

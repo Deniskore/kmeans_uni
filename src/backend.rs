@@ -3,7 +3,19 @@ use crate::kmeans_core_common::calculate_chunk_size;
 use crate::point_source::PointSource;
 use rand::Rng;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreparedCentroidLayout {
+    Identity,
+    #[cfg(feature = "wide")]
+    Simd128,
+    #[cfg(feature = "wide")]
+    Simd256,
+    #[cfg(feature = "wide")]
+    Simd512,
+}
+
 pub trait CoreBackend<F: Primitive> {
+    fn prepared_centroid_layout(k: usize) -> PreparedCentroidLayout;
     fn accumulate_point_slice(point: &[F], ncols: usize, sums: &mut [F], label: usize);
     fn prepare_centroids(centroids: &[F], ncols: usize, k: usize) -> Vec<F>;
     fn finalize_centroids(packed: &[F], ncols: usize, k: usize) -> Vec<F>;
@@ -193,6 +205,7 @@ pub trait CoreBackend<F: Primitive> {
         ncols: usize,
         source: &S,
         rng: &mut R,
+        empty_cluster_buffer: &mut Vec<F>,
     );
 
     /// Updates centroids and returns the maximum absolute centroid shift.
@@ -206,10 +219,19 @@ pub trait CoreBackend<F: Primitive> {
         ncols: usize,
         source: &S,
         rng: &mut R,
+        empty_cluster_buffer: &mut Vec<F>,
     ) -> F {
         let k = counts.len();
         let old_centroids = Self::finalize_centroids(packed_centroids, ncols, k);
-        Self::update_centroids(packed_centroids, sums, counts, ncols, source, rng);
+        Self::update_centroids(
+            packed_centroids,
+            sums,
+            counts,
+            ncols,
+            source,
+            rng,
+            empty_cluster_buffer,
+        );
         let new_centroids = Self::finalize_centroids(packed_centroids, ncols, k);
 
         let mut max_shift = F::zero();
